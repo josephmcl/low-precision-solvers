@@ -80,7 +80,12 @@ void solve_direct(
     int *d_info = static_cast<int *>(st.acquire(sizeof(int)));
 
     /*  Dgetrs solves in place, so the right-hand side is copied into the
-        caller's output before the solve. */
+        caller's output before the solve. The copy is inside the timed region:
+        it is work this method must do to produce X, and hoisting it would
+        credit the method with a solve it did not perform. */
+    timing::stopwatch watch;
+    watch.start();
+
     CUDA_CHECK(cudaMemcpy(
         d_x,
         d_b,
@@ -98,6 +103,8 @@ void solve_direct(
         d_x,
         static_cast<int>(n),
         d_info));
+
+    st.solve_ms = watch.stop();
 
     /*  A direct solve does not iterate. Reported as zero rather than left
         unset, so the column means "did not refine" and not "forgot to

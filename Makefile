@@ -28,7 +28,7 @@ COMMON    := \
 	$(OBJ_DIR)/metrics.o     \
 	$(OBJ_DIR)/solver.o      \
 	$(OBJ_DIR)/solve_direct.o \
-	$(OBJ_DIR)/solve_vendor_irs.o
+	$(OBJ_DIR)/factor_solve_vendor_irs.o
 
 SWEEP_MAIN := $(OBJ_DIR)/main_sweep.o
 PROBE_MAIN := $(OBJ_DIR)/main_probe.o

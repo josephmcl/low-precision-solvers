@@ -10,7 +10,6 @@
 
 namespace solver {
 
-
 void *state::acquire(std::size_t const bytes) {
 
     void *d_p = nullptr;
@@ -27,22 +26,50 @@ state::~state() {
         CUDA_CHECK(cudaFree(_d_owned[i]));
 }
 
+void run(
+    double       *d_x,
+    double const *d_b,
+    method const &m,
+    state        &st,
+    problem      &prob) {
+
+    if (m.is_split()) {
+        m.factor(st, prob);
+        m.solve(d_x, d_b, st, prob);
+
+        /*  total is the sum, not a third measurement of the same work: a
+            separate stopwatch around both would also charge the host-side
+            gap between them. */
+        st.total_ms       = st.factor_ms + st.solve_ms;
+        st.split_reported = true;
+    }
+    else {
+        m.factor_solve(d_x, d_b, st, prob);
+        st.factor_ms      = 0.;
+        st.solve_ms       = 0.;
+        st.split_reported = false;
+    }
+}
+
 /*  The scored methods.
 
-    Ordering here is the ordering in the report, so it runs cheapest-storage
-    first and the reference last. A new method is one entry plus one file
-    pair; nothing else in the harness needs to know it exists. */
+    Ordering here is the ordering in the report. A new method is one entry
+    plus one file pair; nothing else in the harness needs to know it exists.
+    Split methods pass {factor, solve, nullptr}; monolithic ones pass
+    {nullptr, nullptr, factor_solve}. */
 std::vector<method> const &registry() {
 
     static std::vector<method> const methods = {
         {"direct fp64",
          factor_direct,
          solve_direct,
+         nullptr,
          storage::DIRECT_FP64},
 
         {"vendor IRS fp32",
-         factor_vendor_irs,
-         solve_vendor_irs,
+         nullptr,
+         nullptr,
+         factor_solve_vendor_irs,
          storage::VENDOR_IRS}
     };
 
