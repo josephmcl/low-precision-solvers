@@ -34,6 +34,7 @@ struct options {
     std::vector<std::size_t> k        = {64, 512, 2048};
     std::size_t              repeats  = 3;
     matrix_kind              kind     = matrix_kind::diag_dominant;
+    bool                     raw      = false;
 };
 
 std::vector<std::size_t> parse_list(char const *text) {
@@ -69,7 +70,7 @@ void usage() {
 
     std::cout
         << "usage: lps-sweep <n> [--k 64,512,2048] [--repeats 3]\n"
-        << "                     [--matrix diag|moderate|random|graded]\n\n"
+        << "                     [--matrix diag|moderate|random|graded] [--raw]\n\n"
         << "  Reports median of --repeats with spread. Compare any margin\n"
         << "  against the spread before believing it.\n";
 }
@@ -103,6 +104,8 @@ int main(int argc, char **argv) {
             opt.k = parse_list(argv[++i]);
         else if (std::strcmp(argv[i], "--repeats") == 0 && i + 1 != argc)
             opt.repeats = static_cast<std::size_t>(std::atoll(argv[++i]));
+        else if (std::strcmp(argv[i], "--raw") == 0)
+            opt.raw = true;
         else if (std::strcmp(argv[i], "--matrix") == 0 && i + 1 != argc) {
             if (!parse_kind(argv[++i], opt.kind)) {
                 usage();
@@ -164,16 +167,45 @@ int main(int argc, char **argv) {
             std::size_t         n_iterations = 0;
             bool                split        = false;
 
-            /*  Uniform repeats, fresh state each time so the factorization is
-                re-paid and nothing carries over between runs. */
+            /*  One untimed run first, discarded.
+
+                A library warmup on a small problem is not sufficient: cuSOLVER
+                selects kernels and sizes workspace per shape, so warming
+                IRSXgesv at (64, 1) left it cold at (8192, 64) and the first
+                timed repeat carried a ~32 ms penalty — a 62% spread against
+                0.6% on the direct solve. Discarding one run per (method, n, k)
+                is applied to every method identically, so it cannot favour
+                one, and it is the only form of warmup that covers
+                shape-dependent setup.
+
+                Then uniform repeats, fresh state each time so the
+                factorization is re-paid and nothing carries over. */
+            {
+                solver::state warm;
+                solver::run(d_x, prob.d_b, m, warm, prob);
+            }
+
             for (std::size_t r = 0; r != opt.repeats; ++r) {
                 solver::state st;
                 solver::run(d_x, prob.d_b, m, st, prob);
                 total.push_back(st.total_ms);
                 factor.push_back(st.factor_ms);
                 solve.push_back(st.solve_ms);
-                n_iterations = st.n_iterations;
-                split        = st.split_reported;
+
+                /*  Max, not last. Recording only the final repeat would hide
+                    a method whose iteration count varies between runs, which
+                    is itself a result worth seeing. */
+                if (st.n_iterations > n_iterations)
+                    n_iterations = st.n_iterations;
+                split = st.split_reported;
+            }
+
+            if (opt.raw) {
+                std::cout << "    raw " << m.name << ":";
+                for (std::size_t r = 0; r != total.size(); ++r)
+                    std::cout << " " << std::fixed << std::setprecision(1)
+                              << total[r];
+                std::cout << "\n";
             }
 
             /*  The first method in the registry is the fp64 reference, so its
