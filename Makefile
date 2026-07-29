@@ -28,15 +28,20 @@ COMMON    := \
 	$(OBJ_DIR)/metrics.o     \
 	$(OBJ_DIR)/solver.o      \
 	$(OBJ_DIR)/solve_direct.o \
-	$(OBJ_DIR)/factor_solve_vendor_irs.o
+	$(OBJ_DIR)/factor_solve_vendor_irs.o \
+	$(OBJ_DIR)/ozaki.o
 
 SWEEP_MAIN := $(OBJ_DIR)/main_sweep.o
+OZTEST_MAIN := $(OBJ_DIR)/main_ozaki_test.o
 
 .PHONY: all clean
 
-all: $(BIN_DIR)/lps-sweep
+all: $(BIN_DIR)/lps-sweep $(BIN_DIR)/lps-ozaki-test
 
 $(BIN_DIR)/lps-sweep: $(COMMON) $(SWEEP_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN_DIR)/lps-ozaki-test: $(COMMON) $(OZTEST_MAIN) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
 
 
