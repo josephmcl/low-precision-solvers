@@ -66,6 +66,12 @@ std::vector<method> const &registry() {
          nullptr,
          storage::DIRECT_FP64},
 
+        {"split-MPIR",
+         factor_split_mpir,
+         solve_split_mpir,
+         nullptr,
+         storage::SPLIT_MPIR},
+
         {"vendor IRS fp32",
          nullptr,
          nullptr,

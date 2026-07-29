@@ -3,11 +3,13 @@
 #include "gpu/metrics.h"
 #include "gpu/ozaki.h"
 #include "gpu/problem.h"
+#include "gpu/timing.h"
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
 #include <cmath>
+#include <string>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
@@ -123,9 +125,11 @@ int main(int argc, char **argv) {
 
         std::cout << "  " << std::left << std::setw(16) << name_of(which)
                   << std::right
-                  << std::setw(7)  << "pieces"
+                  << std::setw(7)  << "bits"
+                  << std::setw(4)  << "np"
                   << std::setw(7)  << "block"
                   << std::setw(9)  << "prods"
+                  << std::setw(10) << "ms"
                   << std::setw(13) << "rel err" << "\n";
 
         /*  Sweeping the piece count is the real check. Accuracy must improve
@@ -133,15 +137,26 @@ int main(int argc, char **argv) {
             or non-monotonic curve means the pieces are not landing on a common
             grid, which is the failure mode that makes a naive split look like
             it works while delivering plain TF32. */
-        int const blocks[] = {64, 256, 1024, 3072};
-        for (int bi = 0; bi != 4; ++bi)
-        for (int n_pieces = 3; n_pieces <= 6; n_pieces += 3) {
+        /*  (bits, pieces, block). Holding total bits ~54 while moving the
+            bound away from 24 separates "the bound is still marginal" from
+            "a second limit sits below it". */
+        struct trial {int bits; int pieces; int block;};
+        trial const trials[] = {
+            { 9,  6,   64},   /* bound 24.0 -- exactly at the limit */
+            { 9,  6,   32},   /* bound 23.0                          */
+            { 9,  6,   16},   /* bound 22.0                          */
+            { 7,  8,   64},   /* bound 20.0, 56 bits                 */
+            { 6,  9,   64},   /* bound 18.0, 54 bits                 */
+            { 6,  9,  256},   /* bound 20.0, larger block            */
+            { 5, 11,  256}    /* bound 18.0, 55 bits                 */
+        };
+        for (int ti = 0; ti != 7; ++ti) {
 
             ozaki::config cfg;
-            cfg.n_pieces = n_pieces;
-            cfg.bits     = 9;
-            cfg.block    = blocks[bi];
-            cfg.n_groups = n_pieces;
+            cfg.n_pieces = trials[ti].pieces;
+            cfg.bits     = trials[ti].bits;
+            cfg.block    = trials[ti].block;
+            cfg.n_groups = trials[ti].pieces;
 
             ozaki::workspace ws(n, k, cfg, prob);
 
@@ -151,8 +166,18 @@ int main(int argc, char **argv) {
             ozaki::column_max(ws.d_nu, prob.d_b, n, k, prob);
             CUDA_CHECK(cudaDeviceSynchronize());
 
+            /*  One untimed pass first: cuBLAS selects kernels per shape, and
+                the block size changes the shape on every trial. */
             ozaki::accumulate_product(
                 d_acc, d_af, prob.d_b, n, k, which, ws, prob);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMemset(d_acc, 0, n * k * sizeof(double)));
+
+            timing::stopwatch watch;
+            watch.start();
+            ozaki::accumulate_product(
+                d_acc, d_af, prob.d_b, n, k, which, ws, prob);
+            double const ms = watch.stop();
             CUDA_CHECK(cudaDeviceSynchronize());
 
             double const err = metrics::norm_difference(
@@ -160,12 +185,15 @@ int main(int argc, char **argv) {
 
             std::cout << "  " << std::left << std::setw(16) << ""
                       << std::right
-                      << std::setw(7) << n_pieces
+                      << std::setw(7) << cfg.bits
+                      << std::setw(4) << cfg.n_pieces
                       << std::setw(7) << cfg.block
                       << std::setw(9) << cfg.n_products()
+                      << std::setw(10) << std::fixed << std::setprecision(1)
+                      << ms
                       << std::setw(13) << std::scientific << std::setprecision(2)
                       << ((norm_ref > 0.)? err / norm_ref : 0.)
-                      << ((2*cfg.bits+static_cast<int>(std::log2((double)cfg.block)) <= 24)? "   bound ok" : "")
+                      << ("   bound " + std::to_string(2*cfg.bits+static_cast<int>(std::log2((double)cfg.block))) + ", " + std::to_string(cfg.bits_resolved()) + " bits").c_str()
                       << "\n";
         }
         std::cout << "\n";

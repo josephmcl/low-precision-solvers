@@ -34,13 +34,17 @@ bool validate(config const &cfg) {
         ok = false;
     }
 
+    /*  <= 23, not <= 24: fp32 holds a 24-bit value but the intermediate sums
+        need the spare bit. Measured, bound 24.0 gives 4.4e-11 and bound 23.0
+        gives a bit-identical match to fp64. Above the bound the piece count
+        goes inert, so a caller who ignores this gets a result that looks
+        stable under every knob and is wrong by orders. */
     double const bound = 2. * cfg.bits + std::log2(static_cast<double>(cfg.block));
-    if (bound > 24.) {
-        std::cout << "[ozaki] note: 2*bits + log2(block) = " << bound
-                  << " > 24, so fp32 accumulation is not provably exact."
-                     " Measured to hold anyway at this blocking; the bound is"
-                     " sufficient, not necessary. Validate on your matrix"
-                     " class before relying on it.\n";
+    if (bound > 23.) {
+        std::cout << "[ozaki] 2*bits + log2(block) = " << bound
+                  << " > 23: fp32 accumulation is inexact and adding pieces"
+                     " will not help. Reduce bits or block.\n";
+        ok = false;
     }
 
     return ok;

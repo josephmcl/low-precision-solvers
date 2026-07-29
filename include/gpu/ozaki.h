@@ -21,7 +21,10 @@
         a_p * b_q is a multiple of 2^(eA+eB - bits(p+q+2)), <= 2*bits bits
         summed over K terms:                    <= 2*bits + log2(K) bits
 
-    which is EXACT in an fp32 accumulator when that stays under 24.
+    which is EXACT in an fp32 accumulator when that stays under 24 — but see
+    validate(): the usable condition is <= 23, one bit tighter than the
+    derivation, and with that margin the product comes out bit-identical to
+    fp64.
 
     WHY THE GRID IS GLOBAL, NOT PER BLOCK. The grid has to be constant along
     the summed index, so the scale for A is one value per *full* row and for B
@@ -68,32 +71,39 @@ enum class shape {
 
 struct config {
 
-    /*  Pieces per operand, and bits per piece. NP=6 / BITS=9 covers 54 bits
-        with 21 products and is the measured operating point: it beats BITS=10
-        at identical cost, and BITS=11 collapses entirely. */
-    int n_pieces = 6;
-    int bits     = 9;
+    /*  Pieces per operand, and bits per piece. 9 x 6 = 54 bits, 45 products.
+
+        Fewer, wider pieces would issue fewer products (6 x 9 bits is 21), but
+        measured that is SLOWER, because the exactness bound then forces a
+        narrow contraction block and the GEMMs stop filling the machine:
+
+            bits np block  prods     ms   rel err
+              9   6    64     21   11.3  4.37e-11   bound 24 -- inexact
+              9   6    32     21   16.8  0.00e+00
+              6   9   256     45    7.1  0.00e+00   <- default
+              5  11   256     66   10.1  0.00e+00
+
+        Product count is the wrong objective; GEMM width dominates. The fastest
+        configuration is also an exact one. */
+    int n_pieces = 9;
+    int bits     = 6;
 
     /*  Contraction blocking. Sets the live piece footprint at
         n * block * n_pieces * 4 bytes, so it is the knob that keeps the
         transient storage bounded — pre-splitting the whole matrix instead
         costs 48n^2 and breaks any storage claim the method makes.
 
-        Default 64 because that is the largest value satisfying
-        2*bits + log2(block) <= 24 at bits=9, and the sweep in validate()'s
-        comment shows accuracy degrading immediately above it. This is a
-        correctness default, not a performance one: it means many narrow GEMMs,
-        and the cost has not yet been measured. Raising it requires either
-        fewer bits per piece or an accumulator wider than fp32. */
-    int block = 64;
+        Default 256, the largest value satisfying 2*bits + log2(block) <= 23
+        at bits=6. Chosen on measured time, not guessed: see n_pieces. */
+    int block = 256;
 
-    /*  Scale groups kept. Products a_p*b_q depend on (p,q) only through
+    /*  Scale groups kept. Defaults to n_pieces. Products a_p*b_q depend on (p,q) only through
         s = p+q, so those sharing s sit on one grid and can accumulate inside
         cuBLAS with beta=1, exactly — which turns 21 fp64 folds into
         n_groups. Keeping fewer than n_pieces groups truncates the
         lowest-magnitude terms; measured, dropping even one costs two orders
         of accuracy, so this is not a speed knob. */
-    int n_groups = 6;
+    int n_groups = 9;
 
     /*  Products actually issued: n_groups*(n_groups+1)/2. */
     int n_products() const {return n_groups * (n_groups + 1) / 2;}
@@ -110,33 +120,36 @@ struct config {
     silently degrades to TF32 accuracy. Measured, BITS=11 already collapses to
     2e-11, which locates the boundary exactly.
 
-    SOFT-LOOKING BUT BINDING: 2*bits + log2(block) <= 24, the exactness bound
-    above. Measured on this implementation, at n=4096 against an independent
-    fp64 reference:
+    BINDING, AND ONE BIT TIGHTER THAN DERIVED:
 
-        block    bound    3 pieces    6 pieces
-           64     24.0    1.05e-09    4.37e-11
-          256     26.0    2.03e-08    2.02e-08
-         1024     28.0    5.47e-07    5.47e-07
-         3072     29.6    2.90e-06    2.90e-06
+        2*bits + log2(block) <= 23
 
-    The bound binds. Error tracks `block` over four orders, and only where the
-    bound holds does adding pieces buy anything — above it the piece count is
-    inert, which is the signature of pieces not landing on a common grid.
+    Measured at n=4096 against an independent fp64 reference. Satisfying it
+    with that one bit of margin makes the product **bit-identical to fp64**:
+
+        bound   rel err
+         24.0   4.37e-11
+         23.0   0.00e+00
+         22.0   0.00e+00
+         20.0   0.00e+00
+         18.0   0.00e+00
+
+    fp32's 24-bit significand can hold a 24-bit value, but the intermediate
+    sums during accumulation need the spare bit, so the derived <= 24 is off by
+    one. With margin there is no error at all — the split is exact, not merely
+    accurate.
+
+    Above the bound the piece count goes INERT: error tracks `block` over four
+    orders (2.9e-06 at block 3072) and adding pieces changes nothing. That is
+    the diagnostic signature of pieces not landing on a common grid, and it is
+    what to look for if this ever regresses.
 
     THIS CONTRADICTS a prior conclusion, recorded elsewhere, that the bound is
     "sufficient, not necessary" because a 4096-wide block was measured working
-    at 9.6e-15. That was a different implementation and the two disagree by
-    five orders. Do not assume the bound can be violated. If a configuration
-    above the bound appears to work, treat it as an unexplained result and find
-    the structural difference before relying on it — one of the two
-    measurements is wrong, and this one has an independent reference.
-
-    STILL UNRESOLVED: 4.37e-11 at block=64 is not the ~1e-15 that 54 resolved
-    bits should give, so a second limit remains below the bound. That matters,
-    because building R = PA - LU needs the product accurate to ~2^-48 relative
-    for R's own fp32 storage to be the binding term. Diagnose that before using
-    this for the residual-storage method. */
+    at 9.6e-15. The two disagree by five orders and cannot both be right. This
+    one has an independent fp64 reference and a mechanism that predicts the
+    off-by-one. Do not assume the bound can be violated; if a configuration
+    above it appears to work, find the structural difference first. */
 bool validate(config const &cfg);
 
 /*  Piece buffers and scale factors, allocated once and reused.

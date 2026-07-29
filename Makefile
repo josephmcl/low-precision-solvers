@@ -29,7 +29,8 @@ COMMON    := \
 	$(OBJ_DIR)/solver.o      \
 	$(OBJ_DIR)/solve_direct.o \
 	$(OBJ_DIR)/factor_solve_vendor_irs.o \
-	$(OBJ_DIR)/ozaki.o
+	$(OBJ_DIR)/ozaki.o \
+	$(OBJ_DIR)/solve_split_mpir.o
 
 SWEEP_MAIN := $(OBJ_DIR)/main_sweep.o
 OZTEST_MAIN := $(OBJ_DIR)/main_ozaki_test.o

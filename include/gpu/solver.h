@@ -150,6 +150,15 @@ void solve_direct(
     state        &st,
     problem      &prob);
 
+/*  split-MPIR: A as an unevaluated fp32 pair, Ozaki residual, no fp64
+    arithmetic anywhere. 12n^2, same footprint as classical MPIR. */
+void factor_split_mpir(state &st, problem &prob);
+void solve_split_mpir(
+    double       *d_x,
+    double const *d_b,
+    state        &st,
+    problem      &prob);
+
 /*  Vendor baseline: cusolverDnIRSXgesv, classical mixed-precision
     refinement — fp32 factorization, fp64 residual. Monolithic; see the note
     on `method`. */
