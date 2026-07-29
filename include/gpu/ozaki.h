@@ -77,8 +77,15 @@ struct config {
     /*  Contraction blocking. Sets the live piece footprint at
         n * block * n_pieces * 4 bytes, so it is the knob that keeps the
         transient storage bounded — pre-splitting the whole matrix instead
-        costs 48n^2 and breaks any storage claim the method makes. */
-    int block = 3072;
+        costs 48n^2 and breaks any storage claim the method makes.
+
+        Default 64 because that is the largest value satisfying
+        2*bits + log2(block) <= 24 at bits=9, and the sweep in validate()'s
+        comment shows accuracy degrading immediately above it. This is a
+        correctness default, not a performance one: it means many narrow GEMMs,
+        and the cost has not yet been measured. Raising it requires either
+        fewer bits per piece or an accumulator wider than fp32. */
+    int block = 64;
 
     /*  Scale groups kept. Products a_p*b_q depend on (p,q) only through
         s = p+q, so those sharing s sit on one grid and can accumulate inside
@@ -103,18 +110,33 @@ struct config {
     silently degrades to TF32 accuracy. Measured, BITS=11 already collapses to
     2e-11, which locates the boundary exactly.
 
-    SOFT: 2*bits + log2(block) <= 24, the exactness bound above. This is
-    violated by the default configuration — 18 + 11.6 = 29.6 — and works
-    anyway, at full accuracy, with block 16x over the limit. The bound assumes
-    worst-case alignment where every product pushes the accumulator the same
-    way; real products have mixed signs and the running value stays far below
-    2^24. The condition is sufficient, not necessary.
+    SOFT-LOOKING BUT BINDING: 2*bits + log2(block) <= 24, the exactness bound
+    above. Measured on this implementation, at n=4096 against an independent
+    fp64 reference:
 
-    That is a measurement, not a guarantee, and it is the weakest link in any
-    claim built on this code. Accuracy degrades gracefully as the bound is
-    approached from the wrong side, which reads as statistical headroom an
-    adversarial matrix could exhaust. Before this appears in a paper it needs
-    either a probabilistic bound or validation across matrix classes. */
+        block    bound    3 pieces    6 pieces
+           64     24.0    1.05e-09    4.37e-11
+          256     26.0    2.03e-08    2.02e-08
+         1024     28.0    5.47e-07    5.47e-07
+         3072     29.6    2.90e-06    2.90e-06
+
+    The bound binds. Error tracks `block` over four orders, and only where the
+    bound holds does adding pieces buy anything — above it the piece count is
+    inert, which is the signature of pieces not landing on a common grid.
+
+    THIS CONTRADICTS a prior conclusion, recorded elsewhere, that the bound is
+    "sufficient, not necessary" because a 4096-wide block was measured working
+    at 9.6e-15. That was a different implementation and the two disagree by
+    five orders. Do not assume the bound can be violated. If a configuration
+    above the bound appears to work, treat it as an unexplained result and find
+    the structural difference before relying on it — one of the two
+    measurements is wrong, and this one has an independent reference.
+
+    STILL UNRESOLVED: 4.37e-11 at block=64 is not the ~1e-15 that 54 resolved
+    bits should give, so a second limit remains below the bound. That matters,
+    because building R = PA - LU needs the product accurate to ~2^-48 relative
+    for R's own fp32 storage to be the binding term. Diagnose that before using
+    this for the residual-storage method. */
 bool validate(config const &cfg);
 
 /*  Piece buffers and scale factors, allocated once and reused.
