@@ -61,8 +61,10 @@ public:
     double *d_b = nullptr;   /* n x k, the right-hand sides         */
 
     /*  Device scratch the metrics need; owned here so a method's timed
-        region never includes an allocation the harness could have hoisted. */
-    double *d_partial = nullptr;   /* MAX_BLOCKS reduction partials */
+        region never includes an allocation the harness could have hoisted,
+        and so the buffers do not grow across a sweep of many (n, k). */
+    double *d_partial  = nullptr;   /* MAX_BLOCKS reduction partials */
+    double *d_residual = nullptr;   /* n x k, PB - A*X                */
 
     std::size_t n_elements() const {return n * n;}
     std::size_t n_rhs_elements() const {return n * k;}

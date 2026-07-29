@@ -31,17 +31,14 @@ COMMON    := \
 	$(OBJ_DIR)/factor_solve_vendor_irs.o
 
 SWEEP_MAIN := $(OBJ_DIR)/main_sweep.o
-PROBE_MAIN := $(OBJ_DIR)/main_probe.o
 
 .PHONY: all clean
 
-all: $(BIN_DIR)/lps-sweep $(BIN_DIR)/lps-probe
+all: $(BIN_DIR)/lps-sweep
 
 $(BIN_DIR)/lps-sweep: $(COMMON) $(SWEEP_MAIN) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
 
-$(BIN_DIR)/lps-probe: $(COMMON) $(PROBE_MAIN) | $(BIN_DIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cu | $(OBJ_DIR)
 	$(NVCC) $(NVCCFLAGS) -dc $< -o $@

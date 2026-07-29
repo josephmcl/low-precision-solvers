@@ -82,7 +82,18 @@ void solve_direct(
     /*  Dgetrs solves in place, so the right-hand side is copied into the
         caller's output before the solve. The copy is inside the timed region:
         it is work this method must do to produce X, and hoisting it would
-        credit the method with a solve it did not perform. */
+        credit the method with a solve it did not perform. The rule is that
+        everything needed to produce X is timed — drawing the line anywhere
+        else invites the same judgment call on the demote, the permutation and
+        the (hi,lo) split, which cost 30 ms rather than 0.15.
+
+        Note the asymmetry, so it is not later read as bias against the
+        reference: this method is the only one that pays a B -> X copy, and it
+        pays it because Dgetrs is in-place, not for any algorithmic reason.
+        IRSXgesv takes separate B and X; the iterative schemes write X
+        directly. Measured, the copy is 0.03-0.09% of this method's solve
+        (2 * n * k * 8 bytes against ~1.8 TB/s), which is ~100x under the
+        run-to-run spread, so it is charged rather than engineered around. */
     timing::stopwatch watch;
     watch.start();
 

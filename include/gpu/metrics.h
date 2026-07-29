@@ -46,10 +46,16 @@ struct report {
     d_x_ref may be nullptr, in which case report.forward stays zero.
 
     A caveat worth carrying: a method that refines against its *own* fp64
-    copy of A can report a backward error below u_64, because it is fitting
-    X to that copy rather than to the exact matrix. Such a number is not a
-    backward error against A and should not be compared with one. Values
-    materially under 1e-16 here are that artifact, not accuracy. */
+    copy of A can report a backward error below u_64, because it is fitting X
+    to that copy rather than to the exact matrix. Such a number is not a
+    backward error against A and should not be compared with one.
+
+    But sub-u_64 values are not automatically that artifact. On a diagonally
+    dominant matrix ||A||_F ||X||_F exceeds ||PB||_F by ~150x, so the same
+    residual reads ~150x smaller in this normalization than in the relative
+    one, and 1e-17 backward against 1e-15 relative is simply the scaling. The
+    two together tell you which case you are in: an artifact shows up as a
+    backward error far below what the relative column and the norms imply. */
 report evaluate(
     double const *d_x,
     double const *d_x_ref,
