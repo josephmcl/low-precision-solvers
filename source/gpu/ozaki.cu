@@ -8,6 +8,7 @@
 #include <cublas_v2.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <cstddef>
 #include <iostream>
 #include <vector>
@@ -48,6 +49,18 @@ bool validate(config const &cfg) {
     }
 
     return ok;
+}
+
+config from_environment() {
+
+    config cfg;
+
+    if (char const *v = std::getenv("LPS_OZ_BITS"))   cfg.bits     = std::atoi(v);
+    if (char const *v = std::getenv("LPS_OZ_PIECES")) cfg.n_pieces = std::atoi(v);
+    if (char const *v = std::getenv("LPS_OZ_BLOCK"))  cfg.block    = std::atoi(v);
+    cfg.n_groups = cfg.n_pieces;
+
+    return cfg;
 }
 
 /*  ---- scale factors ---------------------------------------------------- */

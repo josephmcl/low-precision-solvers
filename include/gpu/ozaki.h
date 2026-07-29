@@ -110,6 +110,45 @@ struct config {
 
     /*  Total bits of the product this configuration resolves. */
     int bits_resolved() const {return n_pieces * bits;}
+
+    /*  For a product whose result is STORED and reused — R = PA - LU is the
+        case — where the error is undamped and passes straight into everything
+        downstream. Must satisfy the exactness bound; measured bit-identical to
+        fp64. Costs ~3x the refinement configuration. */
+    static config for_stored_product() {
+        config c;
+        c.bits = 6; c.n_pieces = 9; c.n_groups = 9; c.block = 256;
+        return c;
+    }
+
+    /*  For a product consumed immediately by a CONVERGING REFINEMENT, where an
+        inexact residual is self-corrected: it only has to give a good
+        correction direction, and the next iteration cleans up what it got
+        wrong.
+
+        Measured on split-MPIR at n=8192, k=512, sweeping across and far above
+        the exactness bound:
+
+            bits/np/block  bound  solve ms  iters  backward
+                 6/ 9/ 256   20.0     241.1      3  3.24e-17
+                 6/ 9/ 512   21.0     194.4      3  3.24e-17
+                 9/ 6/1536   28.6      87.3      3  3.11e-17
+                 9/ 6/3072   29.6      81.7      3  3.11e-17
+                 5/11/ 512   19.0     273.2      3  3.07e-17
+
+        The converged answer does not move — 3.0e-17 either way, 3 iterations
+        either way — while time varies 3.3x. So violating the bound here is
+        free, and this configuration takes it.
+
+        Do not carry that conclusion over to a stored product. The distinction
+        is the whole point of having two named configurations: the same
+        inexactness that vanishes inside a refinement loop is permanent in a
+        matrix you keep. */
+    static config for_refinement() {
+        config c;
+        c.bits = 9; c.n_pieces = 6; c.n_groups = 6; c.block = 3072;
+        return c;
+    }
 };
 
 /*  Check a configuration and report on std::cout. Returns false only for the
@@ -151,6 +190,17 @@ struct config {
     off-by-one. Do not assume the bound can be violated; if a configuration
     above it appears to work, find the structural difference first. */
 bool validate(config const &cfg);
+
+/*  Defaults, with LPS_OZ_BITS / LPS_OZ_PIECES / LPS_OZ_BLOCK applied if set.
+
+    For tuning sweeps only. An override may place the configuration above the
+    exactness bound, which validate() reports; callers proceed anyway so the
+    inexact regime can be measured deliberately rather than only stumbled
+    into. Whether that regime is acceptable depends on where the product sits:
+    inside a converging refinement its error is corrected by the next
+    iteration, but a product whose result is stored and reused — R = PA - LU —
+    passes its error straight through. */
+config from_environment();
 
 /*  Piece buffers and scale factors, allocated once and reused.
 
