@@ -8,7 +8,6 @@
 
 namespace solver {
 
-using type::real_t;
 using harness::problem;
 
 /*  Method-private factored state.
@@ -51,7 +50,7 @@ struct state {
     float *d_a_lo = nullptr;
 
     /*  fp64 A, for the methods that keep it resident. */
-    real_t *d_a = nullptr;
+    double *d_a = nullptr;
 
     void *acquire(std::size_t const bytes);
 
@@ -81,13 +80,13 @@ struct method {
     /*  Solve for prob.k right-hand sides from the factored state. Writes
         st.n_iterations. d_x is n x k and caller-owned. */
     void (*solve)(
-        real_t       *d_x,
-        real_t const *d_b,
+        double       *d_x,
+        double const *d_b,
         state        &st,
         problem      &prob);
 
     /*  Matrix-resident bytes per n^2 (see namespace storage). */
-    real_t storage_n2;
+    double storage_n2;
 };
 
 /*  The methods the harness scores. Adding a method means adding one entry
@@ -99,8 +98,8 @@ std::vector<method> const &registry();
     everywhere. */
 void factor_direct(state &st, problem &prob);
 void solve_direct(
-    real_t       *d_x,
-    real_t const *d_b,
+    double       *d_x,
+    double const *d_b,
     state        &st,
     problem      &prob);
 
@@ -114,8 +113,8 @@ void solve_direct(
     and the reporter labels it so. */
 void factor_vendor_irs(state &st, problem &prob);
 void solve_vendor_irs(
-    real_t       *d_x,
-    real_t const *d_b,
+    double       *d_x,
+    double const *d_b,
     state        &st,
     problem      &prob);
 

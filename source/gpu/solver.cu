@@ -10,7 +10,6 @@
 
 namespace solver {
 
-using type::real_t;
 
 void *state::acquire(std::size_t const bytes) {
 

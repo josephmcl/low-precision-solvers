@@ -9,7 +9,6 @@
 
 namespace timing {
 
-using type::real_t;
 
 /*  Event-timed regions, repeated, reported as median and spread.
 
@@ -33,18 +32,18 @@ using type::real_t;
         method, so it cannot be applied unevenly. */
 
 struct sample {
-    real_t median = 0.;
-    real_t low    = 0.;
-    real_t high   = 0.;
+    double median = 0.;
+    double low    = 0.;
+    double high   = 0.;
 
     /*  (high - low) / median. Compare against any margin before believing
         it: a 2% margin under a 13% spread is not a result. */
-    real_t spread() const {
+    double spread() const {
         return (median > 0.)? (high - low) / median : 0.;
     }
 };
 
-sample summarize(std::vector<real_t> const &ms);
+sample summarize(std::vector<double> const &ms);
 
 /*  A pair of CUDA events with the elapsed-time call folded in, so a timed
     region reads as start / stop / elapsed and cannot forget to
@@ -63,7 +62,7 @@ public:
 
     /*  Records the stop event, synchronizes on it, and returns
         milliseconds. */
-    real_t stop();
+    double stop();
 
 private:
 

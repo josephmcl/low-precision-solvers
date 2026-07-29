@@ -21,7 +21,6 @@
 
 namespace solver {
 
-using type::real_t;
 using harness::problem;
 
 void factor_direct(state &st, problem &prob) {
@@ -31,7 +30,7 @@ void factor_direct(state &st, problem &prob) {
     /*  Dgetrf overwrites its input, so the reference A is copied. This copy
         is part of the method's honest cost: keeping A resident in fp64 is
         what this method's 8n^2 buys. */
-    st.d_a    = static_cast<real_t *>(st.acquire(n * n * sizeof(real_t)));
+    st.d_a    = static_cast<double *>(st.acquire(n * n * sizeof(double)));
     st.d_ipiv = static_cast<int *>(st.acquire(n * sizeof(int)));
 
     int lwork = 0;
@@ -43,14 +42,14 @@ void factor_direct(state &st, problem &prob) {
         static_cast<int>(n),
         &lwork));
 
-    real_t *d_work = static_cast<real_t *>(
-        st.acquire(static_cast<std::size_t>(lwork) * sizeof(real_t)));
+    double *d_work = static_cast<double *>(
+        st.acquire(static_cast<std::size_t>(lwork) * sizeof(double)));
     int *d_info = static_cast<int *>(st.acquire(sizeof(int)));
 
     CUDA_CHECK(cudaMemcpy(
         st.d_a,
         prob.d_a,
-        n * n * sizeof(real_t),
+        n * n * sizeof(double),
         cudaMemcpyDeviceToDevice));
 
     timing::stopwatch watch;
@@ -70,8 +69,8 @@ void factor_direct(state &st, problem &prob) {
 }
 
 void solve_direct(
-    real_t       *d_x,
-    real_t const *d_b,
+    double       *d_x,
+    double const *d_b,
     state        &st,
     problem      &prob) {
 
@@ -85,7 +84,7 @@ void solve_direct(
     CUDA_CHECK(cudaMemcpy(
         d_x,
         d_b,
-        n * k * sizeof(real_t),
+        n * k * sizeof(double),
         cudaMemcpyDeviceToDevice));
 
     CUSOLVER_CHECK(cusolverDnDgetrs(

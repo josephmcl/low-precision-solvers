@@ -9,15 +9,14 @@
 
 namespace timing {
 
-using type::real_t;
 
-sample summarize(std::vector<real_t> const &ms) {
+sample summarize(std::vector<double> const &ms) {
 
     sample out;
     if (ms.empty())
         return out;
 
-    std::vector<real_t> sorted(ms);
+    std::vector<double> sorted(ms);
     std::sort(sorted.begin(), sorted.end());
 
     std::size_t const n = sorted.size();
@@ -48,7 +47,7 @@ void stopwatch::start() {
     CUDA_CHECK(cudaEventRecord(_begin));
 }
 
-real_t stopwatch::stop() {
+double stopwatch::stop() {
 
     CUDA_CHECK(cudaEventRecord(_end));
     CUDA_CHECK(cudaEventSynchronize(_end));
@@ -56,7 +55,7 @@ real_t stopwatch::stop() {
     float elapsed = 0.f;
     CUDA_CHECK(cudaEventElapsedTime(&elapsed, _begin, _end));
 
-    return static_cast<real_t>(elapsed);
+    return static_cast<double>(elapsed);
 }
 
 } /* namespace timing */

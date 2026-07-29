@@ -11,7 +11,6 @@
 
 namespace harness {
 
-using type::real_t;
 
 /*  The matrix classes the methods are scored on. Conditioning is what
     decides whether a residual-storage scheme holds up: R = PA - LU grows
@@ -58,12 +57,12 @@ public:
     cublasHandle_t     blas   = nullptr;
     cusolverDnHandle_t solver = nullptr;
 
-    real_t *d_a = nullptr;   /* n x n, column major, fp64 reference */
-    real_t *d_b = nullptr;   /* n x k, the right-hand sides         */
+    double *d_a = nullptr;   /* n x n, column major, fp64 reference */
+    double *d_b = nullptr;   /* n x k, the right-hand sides         */
 
     /*  Device scratch the metrics need; owned here so a method's timed
         region never includes an allocation the harness could have hoisted. */
-    real_t *d_partial = nullptr;   /* MAX_BLOCKS reduction partials */
+    double *d_partial = nullptr;   /* MAX_BLOCKS reduction partials */
 
     std::size_t n_elements() const {return n * n;}
     std::size_t n_rhs_elements() const {return n * k;}
