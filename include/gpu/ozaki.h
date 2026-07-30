@@ -267,7 +267,17 @@ void column_max(
     Blocked over the contraction index: only one block of pieces is ever live,
     which is what keeps the footprint at workspace::bytes() instead of 48n^2.
 
-    row_max and column_max must already have been called for this A and X. */
+    row_max and column_max must already have been called for this A and X.
+
+    contraction_limit bounds the summed index: only c < contraction_limit is
+    visited. Pass 0 for the full range.
+
+    This is not a micro-optimization. Forming R = PA - LU one column block at a
+    time, the block starting at column j receives nothing from contraction
+    indices at or beyond j + block_width, because U is upper triangular and
+    those rows of U are structurally zero in these columns. Running the full
+    range anyway does about twice the necessary work — summed over all column
+    blocks the useful part is n^2/2 against n^2. */
 void accumulate_product(
     double            *d_acc,
     float const       *d_a,
@@ -276,6 +286,7 @@ void accumulate_product(
     std::size_t const  n_rhs,
     shape const        which,
     workspace         &ws,
-    problem           &prob);
+    problem           &prob,
+    std::size_t const  contraction_limit = 0);
 
 } /* namespace ozaki */
