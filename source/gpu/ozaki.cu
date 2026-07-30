@@ -69,6 +69,7 @@ config from_environment() {
     if (char const *v = std::getenv("LPS_OZ_BITS"))   cfg.bits     = std::atoi(v);
     if (char const *v = std::getenv("LPS_OZ_PIECES")) cfg.n_pieces = std::atoi(v);
     if (char const *v = std::getenv("LPS_OZ_BLOCK"))  cfg.block    = std::atoi(v);
+    if (char const *v = std::getenv("LPS_OZ_MERGE"))  cfg.merge_tail = std::atoi(v);
     cfg.n_groups = cfg.n_pieces;
 
     return cfg;
@@ -346,6 +347,21 @@ void *workspace::_acquire(std::size_t const bytes) {
 
 /*  ---- the product ------------------------------------------------------ */
 
+/*  Stop the pipeline early, for phase timing.
+
+    0 = full, 1 = splits only, 2 = splits + GEMMs (no fp64 fold). Differencing
+    the three run times gives the split / GEMM / accumulate breakdown without
+    per-kernel events, which would serialize the stream and distort exactly the
+    overlap being measured. Set LPS_OZ_STOP. */
+static int stop_after() {
+
+    static int const value = []{
+        char const *v = std::getenv("LPS_OZ_STOP");
+        return (v == nullptr)? 0 : std::atoi(v);
+    }();
+    return value;
+}
+
 void accumulate_product(
     double            *d_acc,
     float const       *d_a,
@@ -426,13 +442,29 @@ void accumulate_product(
             cfg.bits);
         KERNEL_CHECK();
 
+        if (stop_after() == 1)
+            continue;
+
         /*  Scale-grouped accumulation. Products with p+q = s share an
             exponent grid, so cuBLAS folds them into d_partial with beta=1
             exactly; only one fp64 pass per group is then needed instead of
             one per product. That is 21 folds down to n_groups. */
+        /*  Groups below merge_tail each get their own fp64 fold; groups from
+            merge_tail up accumulate into the same fp32 partial and fold once
+            at the end. */
+        int const tail = (cfg.merge_tail < 0)? cfg.n_groups
+                       : (cfg.merge_tail > cfg.n_groups)? cfg.n_groups
+                       : cfg.merge_tail;
+        bool tail_open = false;
+
         for (int s = 0; s != cfg.n_groups; ++s) {
 
-            bool first = true;
+            bool const merging = (s >= tail);
+
+            /*  Reset the partial only when starting a fold, i.e. at every
+                group below the tail, and once at the tail's first group. */
+            bool first = merging? !tail_open : true;
+
             for (int p = 0; p <= s; ++p) {
 
                 int const q = s - p;
@@ -460,6 +492,14 @@ void accumulate_product(
                 first = false;
             }
 
+            if (merging) {
+                tail_open = true;
+                continue;   /* fold after the last group */
+            }
+
+            if (stop_after() == 2)
+                continue;
+
             if (!first) {
                 accumulate_kernel<<<launch::grid_for(n_rows * n_rhs),
                                     launch::BLOCK_SIZE>>>(
@@ -471,6 +511,18 @@ void accumulate_product(
                     n_rhs);
                 KERNEL_CHECK();
             }
+        }
+
+        if (tail_open && stop_after() != 2) {
+            accumulate_kernel<<<launch::grid_for(n_rows * n_rhs),
+                                launch::BLOCK_SIZE>>>(
+                d_acc,
+                ws.d_partial,
+                n,
+                row_0,
+                n_rows,
+                n_rhs);
+            KERNEL_CHECK();
         }
     }
 }

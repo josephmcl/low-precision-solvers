@@ -105,6 +105,18 @@ struct config {
         of accuracy, so this is not a speed knob. */
     int n_groups = 9;
 
+    /*  Scale groups from this index up share ONE fp64 fold instead of one
+        each. Products in group s carry magnitude ~2^-(bits*s), so for large s
+        the cross-grid rounding incurred by adding them on a common grid is far
+        below the budget the split is trying to hold — earlier work validated
+        merging everything from s=3 and measured it slightly MORE accurate, not
+        less. n_groups disables merging.
+
+        This is the one lever left on the accumulator traffic, which the column
+        block sweep showed dominates the R build: it turns n_groups fp64 passes
+        per contraction block into merge_tail+1. */
+    int merge_tail = 3;
+
     /*  Products actually issued: n_groups*(n_groups+1)/2. */
     int n_products() const {return n_groups * (n_groups + 1) / 2;}
 

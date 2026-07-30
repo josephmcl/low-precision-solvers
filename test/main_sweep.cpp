@@ -36,6 +36,7 @@ struct options {
     std::size_t              repeats  = 3;
     matrix_kind              kind     = matrix_kind::diag_dominant;
     bool                     raw      = false;
+    unsigned                 seed     = 7u;
 };
 
 std::vector<std::size_t> parse_list(char const *text) {
@@ -71,7 +72,8 @@ void usage() {
 
     std::cout
         << "usage: lps-sweep <n> [--k 64,512,2048] [--repeats 3]\n"
-        << "                     [--matrix diag|moderate|random|graded] [--raw]\n\n"
+        << "                     [--matrix diag|moderate|random|graded]\n"
+        << "                     [--seed 7] [--raw]\n\n"
         << "  Reports median of --repeats with spread. Compare any margin\n"
         << "  against the spread before believing it.\n";
 }
@@ -112,6 +114,8 @@ int main(int argc, char **argv) {
             opt.k = parse_list(argv[++i]);
         else if (std::strcmp(argv[i], "--repeats") == 0 && i + 1 != argc)
             opt.repeats = static_cast<std::size_t>(std::atoll(argv[++i]));
+        else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 != argc)
+            opt.seed = static_cast<unsigned>(std::atoll(argv[++i]));
         else if (std::strcmp(argv[i], "--raw") == 0)
             opt.raw = true;
         else if (std::strcmp(argv[i], "--matrix") == 0 && i + 1 != argc) {
@@ -133,7 +137,8 @@ int main(int argc, char **argv) {
               << prop.totalGlobalMem / 1000000000. << " GB)\n"
               << "matrix   " << harness::name_of(opt.kind) << "\n"
               << "n        " << opt.n << "\n"
-              << "repeats  " << opt.repeats << "  (median reported)\n";
+              << "repeats  " << opt.repeats << "  (median reported)\n"
+              << "seed     " << opt.seed << "\n";
 
     std::vector<solver::method> const &methods = solver::registry();
 
@@ -143,7 +148,7 @@ int main(int argc, char **argv) {
 
         /*  One problem per (n, k): every method below is scored on
             bit-identical A and B. */
-        harness::problem prob(opt.n, k, opt.kind);
+        harness::problem prob(opt.n, k, opt.kind, opt.seed);
 
         if (ki == 0)
             std::cout << "tuning   " << tuning::current().source() << "\n\n";

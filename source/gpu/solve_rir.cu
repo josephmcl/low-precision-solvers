@@ -349,6 +349,7 @@ void factor_rir(state &st, problem &prob) {
     cfg.n_pieces = tuning::current().get("rir.build.ozaki.pieces", base.n_pieces);
     cfg.block    = tuning::current().get("rir.build.ozaki.block",  base.block);
     cfg.n_groups = cfg.n_pieces;
+    cfg.merge_tail = tuning::current().get("rir.build.ozaki.merge_tail", base.merge_tail);
     ozaki::workspace ws(n, nb, cfg, prob);
 
     timing::stopwatch watch;
@@ -436,6 +437,8 @@ void solve_rir(
     cfg.n_pieces = tuning::current().get("rir.solve.ozaki.pieces", base.n_pieces);
     cfg.block    = tuning::current().get("rir.solve.ozaki.block",  base.block);
     cfg.n_groups = cfg.n_pieces;
+    cfg.merge_tail = tuning::current().get("rir.solve.ozaki.merge_tail",
+                                           base.merge_tail);
     ozaki::workspace ws(n, k, cfg, prob);
 
     /*  R*X never cancels — R is already ~2^-24 of A — which is the structural

@@ -276,6 +276,7 @@ void solve_split_mpir(
     cfg.n_pieces = tuning::current().get("mpir.ozaki.pieces", base.n_pieces);
     cfg.block    = tuning::current().get("mpir.ozaki.block",  base.block);
     cfg.n_groups = cfg.n_pieces;
+    cfg.merge_tail = tuning::current().get("mpir.ozaki.merge_tail", base.merge_tail);
     ozaki::workspace ws(n, k, cfg, prob);
 
     ozaki::row_max(ws.d_mu, st.d_a_hi, n, n, ozaki::shape::full, prob);
