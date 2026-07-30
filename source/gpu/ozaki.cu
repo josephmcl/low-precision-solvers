@@ -35,18 +35,29 @@ bool validate(config const &cfg) {
         ok = false;
     }
 
-    /*  <= 23, not <= 24: fp32 holds a 24-bit value but the intermediate sums
-        need the spare bit. Measured, bound 24.0 gives 4.4e-11 and bound 23.0
-        gives a bit-identical match to fp64. Above the bound the piece count
-        goes inert, so a caller who ignores this gets a result that looks
-        stable under every knob and is wrong by orders. */
+    /*  The bound is sufficient, not necessary, and whether it binds depends on
+        the OPERANDS, not just the configuration. Measured at n=4096:
+
+            operand                 bound 20   bound 28.6/29.6
+            near-random A * X       exact      2.9e-06   <- binds hard
+            L * U from a getrf      7.3e-16    7.3e-16   <- does not bind
+
+        Triangular factors have a far narrower per-row dynamic range and their
+        products carry mixed signs, so the running fp32 value stays well under
+        2^24 even when the worst-case count says it should not. A random matrix
+        does not get that.
+
+        So this warns rather than fails: above the bound is legitimate and 2.4x
+        faster for the R build, and wrong by four orders for a dense residual.
+        Verify on YOUR operands — the sweep is cheap and the failure is silent
+        (above the bound, adding pieces stops changing the answer, which is the
+        signature to watch for). */
     double const bound = 2. * cfg.bits + std::log2(static_cast<double>(cfg.block));
-    if (bound > 23.) {
-        std::cout << "[ozaki] 2*bits + log2(block) = " << bound
-                  << " > 23: fp32 accumulation is inexact and adding pieces"
-                     " will not help. Reduce bits or block.\n";
-        ok = false;
-    }
+    if (bound > 23.)
+        std::cout << "[ozaki] note: 2*bits + log2(block) = " << bound
+                  << " > 23, so fp32 accumulation is not provably exact."
+                     " Whether it matters depends on the operands; verify"
+                     " against a reference before relying on it.\n";
 
     return ok;
 }

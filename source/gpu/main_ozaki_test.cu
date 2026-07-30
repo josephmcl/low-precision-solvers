@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cusolverDn.h>
 
 #include <cmath>
 #include <string>
@@ -58,6 +59,30 @@ __global__ void promote_kernel(
         if (which == 1 && j >= i) v = 0.;
         if (which == 2 && j <  i) v = 0.;
         d_a[idx] = v;
+    }
+}
+
+/*  Promote the strict lower / upper triangle of a packed LU factor into fp64,
+    so the reference sees the same operand the Ozaki path reads through. */
+__global__ void promote_triangle_kernel(
+    double            *d_out,
+    float const       *d_lu,
+    std::size_t const  n,
+    int const          which) {
+
+    std::size_t const n_total = n * n;
+
+    for (std::size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < n_total;
+         idx += static_cast<std::size_t>(blockDim.x) * gridDim.x) {
+
+        std::size_t const i = idx % n;
+        std::size_t const j = idx / n;
+
+        double v = static_cast<double>(d_lu[idx]);
+        if (which == 1 && j >= i) v = 0.;
+        if (which == 2 && j <  i) v = 0.;
+        d_out[idx] = v;
     }
 }
 
@@ -197,6 +222,105 @@ int main(int argc, char **argv) {
                       << "\n";
         }
         std::cout << "\n";
+    }
+
+    /*  ---- the R-build case: L * U from a real factorization ----------------
+
+        The sweep above uses a near-random A against a random X. The R build is
+        L * U, whose rows have a completely different dynamic range, and the
+        exactness bound's effect may not carry across. This is the operand
+        structure that actually matters, because R = PA - LU is the one product
+        whose error is stored rather than corrected. */
+    {
+        std::cout << "L * U from a real factorization (the R-build operand)\n";
+
+        float *d_lu = static_cast<float *>(prob.acquire(n * n * sizeof(float)));
+        int *d_ipiv = static_cast<int *>(prob.acquire(n * sizeof(int)));
+        int *d_info = static_cast<int *>(prob.acquire(sizeof(int)));
+
+        CUDA_CHECK(cudaMemcpy(d_lu, d_af, n * n * sizeof(float),
+                              cudaMemcpyDeviceToDevice));
+
+        int lwork = 0;
+        CUSOLVER_CHECK(cusolverDnSgetrf_bufferSize(
+            prob.solver, static_cast<int>(n), static_cast<int>(n),
+            d_lu, static_cast<int>(n), &lwork));
+        float *d_work = static_cast<float *>(
+            prob.acquire(static_cast<std::size_t>(lwork) * sizeof(float)));
+        CUSOLVER_CHECK(cusolverDnSgetrf(
+            prob.solver, static_cast<int>(n), static_cast<int>(n),
+            d_lu, static_cast<int>(n), d_work, d_ipiv, d_info));
+
+        /*  U promoted to fp64 is the right operand. L is read out of the packed
+            factor through shape::lower, which is the STRICT triangle, so the
+            unit diagonal contributes U itself: L*U = strict_L*U + U. */
+        double *d_u = static_cast<double *>(prob.acquire(n * n * sizeof(double)));
+        promote_triangle_kernel<<<launch::grid_for(n * n), launch::BLOCK_SIZE>>>(
+            d_u, d_lu, n, 2);
+        KERNEL_CHECK();
+
+        double *d_l = static_cast<double *>(prob.acquire(n * n * sizeof(double)));
+        promote_triangle_kernel<<<launch::grid_for(n * n), launch::BLOCK_SIZE>>>(
+            d_l, d_lu, n, 1);
+        KERNEL_CHECK();
+
+        double *d_lu_ref = static_cast<double *>(
+            prob.acquire(n * n * sizeof(double)));
+        double const one = 1., zero = 0.;
+        CUBLAS_CHECK(cublasDgemm(
+            prob.blas, CUBLAS_OP_N, CUBLAS_OP_N,
+            static_cast<int>(n), static_cast<int>(n), static_cast<int>(n),
+            &one, d_l, static_cast<int>(n), d_u, static_cast<int>(n),
+            &zero, d_lu_ref, static_cast<int>(n)));
+
+        double const norm_lu = metrics::norm(d_lu_ref, n * n, prob);
+
+        double *d_out = static_cast<double *>(
+            prob.acquire(n * n * sizeof(double)));
+
+        std::cout << "  " << std::right << std::setw(7) << "bits"
+                  << std::setw(4) << "np" << std::setw(7) << "block"
+                  << std::setw(8) << "bound" << std::setw(10) << "ms"
+                  << std::setw(13) << "rel err" << "\n";
+
+        struct t2 {int bits; int pieces; int block;};
+        t2 const cases[] = {{6, 9, 256}, {9, 6, 1536}, {9, 6, 3072}};
+
+        for (int ci = 0; ci != 3; ++ci) {
+
+            ozaki::config cfg;
+            cfg.bits = cases[ci].bits; cfg.n_pieces = cases[ci].pieces;
+            cfg.n_groups = cases[ci].pieces; cfg.block = cases[ci].block;
+
+            ozaki::workspace ws2(n, n, cfg, prob);
+            ozaki::row_max(ws2.d_mu, d_lu, n, n, ozaki::shape::lower, prob);
+            ozaki::column_max(ws2.d_nu, d_u, n, n, prob);
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            CUDA_CHECK(cudaMemset(d_out, 0, n * n * sizeof(double)));
+            ozaki::accumulate_product(
+                d_out, d_lu, d_u, n, n, ozaki::shape::lower, ws2, prob);
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            timing::stopwatch w2;
+            CUDA_CHECK(cudaMemset(d_out, 0, n * n * sizeof(double)));
+            w2.start();
+            ozaki::accumulate_product(
+                d_out, d_lu, d_u, n, n, ozaki::shape::lower, ws2, prob);
+            double const ms2 = w2.stop();
+
+            double const err2 = metrics::norm_difference(
+                d_out, d_lu_ref, n * n, prob);
+
+            std::cout << "  " << std::right << std::setw(7) << cfg.bits
+                      << std::setw(4) << cfg.n_pieces
+                      << std::setw(7) << cfg.block
+                      << std::setw(8) << std::fixed << std::setprecision(1)
+                      << 2. * cfg.bits + std::log2((double) cfg.block)
+                      << std::setw(10) << ms2
+                      << std::setw(13) << std::scientific << std::setprecision(2)
+                      << ((norm_lu > 0.)? err2 / norm_lu : 0.) << "\n";
+        }
     }
 
     return 0;
