@@ -159,6 +159,19 @@ struct config {
         1-2% when it applies. */
     int merge_tail = -1;
 
+    /*  Ablation switches, on by default. Present so each structural
+        optimization can be turned off individually and measured, rather than
+        argued about — see test/main_ablate.cpp.
+
+        triangular: read the operand through its triangle and skip the
+        structurally-zero row range. Off means every block is treated as dense.
+
+        contraction_bound: honour the caller's contraction_limit. Off means the
+        summed index always runs the full range, which is what a build does if
+        it forgets that U's rows beyond the current column block are zero. */
+    bool triangular        = true;
+    bool contraction_bound = true;
+
     /*  Products actually issued: n_groups*(n_groups+1)/2. */
     int n_products() const {return n_groups * (n_groups + 1) / 2;}
 

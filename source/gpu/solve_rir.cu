@@ -106,6 +106,10 @@ ozaki::config config_for(std::string const &prefix) {
     cfg.block      = tuning::current().get(prefix + ".ozaki.block",
                                            base.block);
     cfg.n_groups   = cfg.n_pieces;
+    cfg.triangular =
+        tuning::current().get("ozaki.triangular", 1) != 0;
+    cfg.contraction_bound =
+        tuning::current().get("ozaki.contraction_bound", 1) != 0;
     cfg.merge_tail = tuning::current().get(prefix + ".ozaki.merge_tail",
                                            base.merge_tail);
     return cfg;
@@ -226,6 +230,8 @@ void solve_rir(
     double *d_prev = static_cast<double *>(st.acquire(nk * sizeof(double)));
     double *d_t    = static_cast<double *>(st.acquire(nk * sizeof(double)));
     double *d_neg  = static_cast<double *>(st.acquire(nk * sizeof(double)));
+    float  *d_xf   = static_cast<float *>(st.acquire(nk * sizeof(float)));
+    float  *d_rx   = static_cast<float *>(st.acquire(nk * sizeof(float)));
     float  *d_y    = static_cast<float *>(st.acquire(nk * sizeof(float)));
 
     ozaki::config const cfg = config_for("rir.solve");
@@ -233,6 +239,26 @@ void solve_rir(
 
     bool const tf32_outer =
         tuning::current().get("rir.solve.tf32_outer", 0) != 0;
+
+    /*  R*X as a single fp32 GEMM instead of an Ozaki cascade.
+
+        The precision map for this scheme measured R*X as needing fp32 and only
+        fp32 — TF32 is 176x too coarse, but plain fp32 is sufficient — and a
+        cublasSgemm is exactly fp32. The Ozaki path here was inherited from
+        sharing code with the mp-TRSM, which genuinely does need it; R*X does
+        not. One SGEMM replaces 21 TF32 products.
+
+        Why the error is tolerable: R is already small, ||R||/||A|| ~ 6e-8, so
+        an fp32 GEMM's ~2^-24*sqrt(n) relative error on R*X lands near 3e-13
+        relative to ||A||*||X||, which is what the backward error normalizes by.
+
+        Only for an fp32-stored R: a packed R would have to be unpacked to feed
+        cuBLAS, and a full-width fp32 copy costs 4n^2, which is exactly the
+        storage the packing was buying back. A blocked unpack would work and is
+        not implemented. */
+    bool const plain_rx =
+        st.r_format == ozaki::format::fp32 &&
+        tuning::current().get("rir.solve.plain_rx", 1) != 0;
 
     /*  R*X never cancels — R is already ~2^-24 of A — which is the structural
         reason this form needs no fp64. Negated once so the residual is an
@@ -256,20 +282,48 @@ void solve_rir(
     std::size_t const cap = static_cast<std::size_t>(
         tuning::current().get("rir.solve.max_outer", 8));
 
+    /*  Convergence tolerance, as a NEGATIVE power of ten on the sum of
+        squares — so -20 means ||dX|| has fallen to 1e-10 of its first step.
+        Tunable because the right value moved when R*X became a plain SGEMM:
+        the iterate now converges to a slightly coarser floor, and a threshold
+        set against the old floor spends a full pass confirming it. */
+    double const tol = std::pow(
+        10., static_cast<double>(
+            tuning::current().get("rir.solve.tol_exp", -12)));
+
     for (std::size_t it = 0; it != cap; ++it) {
 
         CUDA_CHECK(cudaMemcpy(
             d_rhs, d_pb, nk * sizeof(double), cudaMemcpyDeviceToDevice));
 
         if (it != 0) {
-            ozaki::column_max(ws.d_nu, d_x, n, k, prob);
-            convert::zero(d_neg, nk, prob);
-            /*  Subtracted rather than accumulated: R is packed, so negating
-                it in place is no longer a single kernel over floats. */
-            ozaki::accumulate_product(
-                d_neg, st.d_r, d_x, n, k, ozaki::shape::full, ws, prob,
-                0, st.r_format);
-            convert::subtract(d_rhs, d_neg, nk, prob);
+            if (!plain_rx) {
+                ozaki::column_max(ws.d_nu, d_x, n, k, prob);
+                convert::zero(d_neg, nk, prob);
+            }
+            if (plain_rx) {
+                float const minus_one = -1.f, zero = 0.f;
+                convert::demote(d_xf, d_x, nk, prob);
+                CUBLAS_CHECK(cublasSgemm(
+                    prob.blas,
+                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    static_cast<int>(n), static_cast<int>(k),
+                    static_cast<int>(n),
+                    &minus_one,
+                    static_cast<float const *>(st.d_r), static_cast<int>(n),
+                    d_xf, static_cast<int>(n),
+                    &zero,
+                    d_rx, static_cast<int>(n)));
+                convert::add_correction(d_rhs, d_rx, nk, prob);
+            }
+            else {
+                /*  Subtracted rather than accumulated: R is packed, so
+                    negating it in place is no longer a single kernel. */
+                ozaki::accumulate_product(
+                    d_neg, st.d_r, d_x, n, k, ozaki::shape::full, ws, prob,
+                    0, st.r_format);
+                convert::subtract(d_rhs, d_neg, nk, prob);
+            }
         }
 
         convert::demote(d_y, d_rhs, nk, prob);
@@ -294,7 +348,7 @@ void solve_rir(
             first = current;
         else {
             bool const stalled   = current > 0.25 * previous;
-            bool const converged = current <= 1e-20 * first;
+            bool const converged = current <= tol * first;
             if (stalled || converged)
                 break;
         }

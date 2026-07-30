@@ -59,6 +59,10 @@ config from_environment() {
     if (char const *v = std::getenv("LPS_OZ_PIECES")) cfg.n_pieces = std::atoi(v);
     if (char const *v = std::getenv("LPS_OZ_BLOCK"))  cfg.block    = std::atoi(v);
     if (char const *v = std::getenv("LPS_OZ_MERGE"))  cfg.merge_tail = std::atoi(v);
+    if (char const *v = std::getenv("LPS_OZ_TRIANGULAR"))
+        cfg.triangular = std::atoi(v) != 0;
+    if (char const *v = std::getenv("LPS_OZ_CONTRACTION_BOUND"))
+        cfg.contraction_bound = std::atoi(v) != 0;
     cfg.n_groups = cfg.n_pieces;
 
     return cfg;
@@ -302,8 +306,18 @@ __global__ void split_a_kernel(
     std::size_t const r = blockIdx.x * blockDim.x + threadIdx.x;
     std::size_t const c = blockIdx.y;
 
-    if (r >= n_rows || c >= n_cols)
+    if (r >= n_rows)
         return;
+
+    /*  Slots are padded to the full block width, not truncated to n_cols, so
+        every piece sits at the same stride and A_0..A_s can be handed to one
+        GEMM as a single contiguous k-extent. The padding is zeroed, so it
+        contributes nothing to the product. */
+    if (c >= n_cols) {
+        for (int p = 0; p != n_pieces; ++p)
+            d_pieces[r + c * n_rows + static_cast<std::size_t>(p) * stride] = 0.f;
+        return;
+    }
 
     std::size_t const i = row_0 + r;
     std::size_t const j = col_0 + c;
@@ -469,7 +483,10 @@ void accumulate_product(
     config     const &cfg = ws.cfg;
 
     std::size_t const k_end =
-        (contraction_limit == 0 || contraction_limit > n)? n : contraction_limit;
+        (!cfg.contraction_bound || contraction_limit == 0 ||
+         contraction_limit > n)? n : contraction_limit;
+
+    shape const eff = cfg.triangular? which : shape::full;
 
     std::size_t const b  = static_cast<std::size_t>(cfg.block);
     std::size_t const np = static_cast<std::size_t>(cfg.n_pieces);
@@ -486,15 +503,17 @@ void accumulate_product(
             them is where the triangular advantage comes from. */
         std::size_t row_0  = 0;
         std::size_t n_rows = n;
-        if (which == shape::lower) {
+        if (eff == shape::lower) {
             row_0  = c_0;
             n_rows = n - c_0;
         }
-        else if (which == shape::upper) {
+        else if (eff == shape::upper) {
             row_0  = 0;
             n_rows = c_0 + n_c;
         }
 
+        /*  Both operands now use full-block-width slots, so a group's pieces
+            are contiguous and can be issued as one GEMM. */
         std::size_t const stride_a = n_rows * b;
         std::size_t const stride_x = b * n_rhs;
 
