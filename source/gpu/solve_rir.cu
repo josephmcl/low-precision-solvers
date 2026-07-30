@@ -2,6 +2,7 @@
 
 #include "gpu/error.h"
 #include "gpu/ozaki.h"
+#include "gpu/tuning.h"
 #include "gpu/timing.h"
 
 #include <cuda_runtime.h>
@@ -301,7 +302,8 @@ void factor_rir(state &st, problem &prob) {
         would cost 8n^2 on top of the 8n^2 this scheme keeps, doubling the peak
         footprint and destroying the only claim it has. The transient here is
         n * COLUMN_BLOCK * 8 bytes — 0.5n^2 at n=8192. */
-    std::size_t const COLUMN_BLOCK = 512;
+    std::size_t const COLUMN_BLOCK = static_cast<std::size_t>(
+        tuning::current().get("rir.build.column_block", 512));
     std::size_t const nb = std::min(COLUMN_BLOCK, n);
 
     double *d_acc = static_cast<double *>(
@@ -316,13 +318,12 @@ void factor_rir(state &st, problem &prob) {
         because triangular factors have a narrow per-row dynamic range. That is
         operand-specific: the same configuration is wrong by four orders on a
         dense random product. */
-    ozaki::config cfg = ozaki::config::for_refinement();
-    {
-        ozaki::config const env = ozaki::from_environment();
-        if (std::getenv("LPS_OZ_BITS") || std::getenv("LPS_OZ_PIECES") ||
-            std::getenv("LPS_OZ_BLOCK"))
-            cfg = env;
-    }
+    ozaki::config const base = ozaki::config::for_refinement();
+    ozaki::config cfg;
+    cfg.bits     = tuning::current().get("rir.build.ozaki.bits",   base.bits);
+    cfg.n_pieces = tuning::current().get("rir.build.ozaki.pieces", base.n_pieces);
+    cfg.block    = tuning::current().get("rir.build.ozaki.block",  base.block);
+    cfg.n_groups = cfg.n_pieces;
     ozaki::workspace ws(n, nb, cfg, prob);
 
     timing::stopwatch watch;
@@ -400,7 +401,12 @@ void solve_rir(
     double *d_rhs = static_cast<double *>(st.acquire(nk * sizeof(double)));
     float  *d_y   = static_cast<float *>(st.acquire(nk * sizeof(float)));
 
-    ozaki::config cfg = ozaki::config::for_refinement();
+    ozaki::config const base = ozaki::config::for_refinement();
+    ozaki::config cfg;
+    cfg.bits     = tuning::current().get("rir.solve.ozaki.bits",   base.bits);
+    cfg.n_pieces = tuning::current().get("rir.solve.ozaki.pieces", base.n_pieces);
+    cfg.block    = tuning::current().get("rir.solve.ozaki.block",  base.block);
+    cfg.n_groups = cfg.n_pieces;
     ozaki::workspace ws(n, k, cfg, prob);
 
     /*  R*X never cancels — R is already ~2^-24 of A — which is the structural

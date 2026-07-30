@@ -126,6 +126,13 @@ long long max_n(
 
 int main(int argc, char **argv) {
 
+    /*  Unbuffered. A harness that loses its output when it crashes turns a
+        one-line failure into a bisection: three separate debugging rounds here
+        were spent re-running a segfault whose diagnostic had already been
+        printed into a buffer that was then discarded. The cost is negligible —
+        this program prints tens of lines, not millions. */
+    std::cout.setf(std::ios::unitbuf);
+
     std::size_t const n = (argc > 1)?
         static_cast<std::size_t>(std::atoll(argv[1])) : 8192;
 

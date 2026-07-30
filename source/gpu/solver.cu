@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <iostream>
 #include <vector>
 
 namespace solver {
@@ -32,6 +33,18 @@ void run(
     method const &m,
     state        &st,
     problem      &prob) {
+
+    /*  Report any error left pending before this method starts.
+
+        A CUDA error is sticky: once one is raised, every subsequent call fails
+        with it, so the first method to break makes the NEXT method look
+        broken. Checking here attributes the fault to whoever actually caused
+        it. Without this, a fault in method i is read as a fault in method i+1
+        — which cost several debugging rounds. */
+    if (cudaError_t const pending = cudaGetLastError(); pending != cudaSuccess)
+        std::cout << "[solver] error pending BEFORE " << m.name << ": "
+                  << cudaGetErrorString(pending)
+                  << " (raised by an earlier method, not this one)\n";
 
     if (m.is_split()) {
         m.factor(st, prob);

@@ -17,8 +17,15 @@ INCLUDE   := -Iinclude
 
 # C++17 is the CUDA floor; host flags carry the same warning posture as the
 # rest of the project. New code must compile clean under these.
+# -MMD -MP emit a .d per object listing the headers it used, which is what
+# makes a header edit rebuild its dependents. Without this, editing a header
+# leaves stale objects compiled against the OLD struct layout linked against
+# fresh ones — an ODR violation that presents as a vendor handle read from the
+# wrong offset, i.e. a library call failing with NOT_INITIALIZED in a method
+# that has nothing wrong with it. That cost most of a debugging session.
 NVCCFLAGS := -std=c++17 -O3 $(INCLUDE) \
              -arch=$(CUDA_ARCH) \
+             -MMD -MP \
              -Xcompiler -Wall,-Wpedantic
 
 LDLIBS    := -lcublas -lcusolver
@@ -33,6 +40,7 @@ COMMON    := \
 	$(OBJ_DIR)/definitions.o \
 	$(OBJ_DIR)/error.o       \
 	$(OBJ_DIR)/timing.o      \
+	$(OBJ_DIR)/tuning.o      \
 	$(OBJ_DIR)/problem.o     \
 	$(OBJ_DIR)/metrics.o     \
 	$(OBJ_DIR)/ozaki.o       \
@@ -73,3 +81,6 @@ $(OBJ_DIR) $(TOBJ_DIR) $(BIN_DIR):
 
 clean:
 	rm -rf build $(BIN_DIR)
+
+-include $(COMMON:.o=.d)
+-include $(SWEEP_MAIN:.o=.d) $(PROBE_MAIN:.o=.d) $(OZTEST_MAIN:.o=.d)

@@ -2,6 +2,7 @@
 
 #include "gpu/definitions.h"
 #include "gpu/error.h"
+#include "gpu/tuning.h"
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -10,9 +11,20 @@
 #include <cmath>
 #include <cstddef>
 #include <iostream>
+#include <string>
 #include <vector>
 
 namespace harness {
+
+/*  cudaDeviceProp.name, for the tuning lookup. Read here rather than passed
+    in so no caller has to remember to. */
+static std::string _device_name() {
+
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess)
+        return "unknown";
+    return std::string(prop.name);
+}
 
 char const *name_of(matrix_kind const kind) {
 
@@ -102,6 +114,8 @@ problem::problem(
 
     CUBLAS_CHECK(cublasCreate(&blas));
     CUSOLVER_CHECK(cusolverDnCreate(&solver));
+
+    tuning::current().load(_device_name());
 
     d_a = static_cast<double *>(acquire(n * n * sizeof(double)));
     d_b = static_cast<double *>(acquire(n * k * sizeof(double)));

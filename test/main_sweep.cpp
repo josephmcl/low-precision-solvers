@@ -4,6 +4,7 @@
 #include "gpu/problem.h"
 #include "gpu/solver.h"
 #include "gpu/timing.h"
+#include "gpu/tuning.h"
 
 #include <cuda_runtime.h>
 
@@ -89,6 +90,13 @@ void print_ms(double const ms, bool const known) {
 
 int main(int argc, char **argv) {
 
+    /*  Unbuffered. A harness that loses its output when it crashes turns a
+        one-line failure into a bisection: three separate debugging rounds here
+        were spent re-running a segfault whose diagnostic had already been
+        printed into a buffer that was then discarded. The cost is negligible —
+        this program prints tens of lines, not millions. */
+    std::cout.setf(std::ios::unitbuf);
+
     options opt;
 
     if (argc > 1 && (std::strcmp(argv[1], "-h") == 0 ||
@@ -125,7 +133,7 @@ int main(int argc, char **argv) {
               << prop.totalGlobalMem / 1000000000. << " GB)\n"
               << "matrix   " << harness::name_of(opt.kind) << "\n"
               << "n        " << opt.n << "\n"
-              << "repeats  " << opt.repeats << "  (median reported)\n\n";
+              << "repeats  " << opt.repeats << "  (median reported)\n";
 
     std::vector<solver::method> const &methods = solver::registry();
 
@@ -136,6 +144,14 @@ int main(int argc, char **argv) {
         /*  One problem per (n, k): every method below is scored on
             bit-identical A and B. */
         harness::problem prob(opt.n, k, opt.kind);
+
+        if (ki == 0) {
+            std::cout << "tuning   " << tuning::current().source() << "\n\n";
+            std::vector<std::string> const stale = tuning::current().unused();
+            for (std::size_t i = 0; i != stale.size(); ++i)
+                std::cout << "[tuning] key never read: " << stale[i]
+                          << " (typo, or a parameter that no longer exists)\n";
+        }
 
         double *d_x = static_cast<double *>(
             prob.acquire(opt.n * k * sizeof(double)));

@@ -3,6 +3,7 @@
 #include "gpu/error.h"
 #include "gpu/metrics.h"
 #include "gpu/ozaki.h"
+#include "gpu/tuning.h"
 #include "gpu/timing.h"
 
 #include <cuda_runtime.h>
@@ -269,13 +270,12 @@ void solve_split_mpir(
     /*  The residual is consumed immediately by the refinement, so the
         inexact-but-fast configuration is correct here: measured, the converged
         backward error is identical to the exact one at 3x the speed. */
-    ozaki::config cfg = ozaki::config::for_refinement();
-    {
-        ozaki::config const env = ozaki::from_environment();
-        if (std::getenv("LPS_OZ_BITS") || std::getenv("LPS_OZ_PIECES") ||
-            std::getenv("LPS_OZ_BLOCK"))
-            cfg = env;
-    }
+    ozaki::config const base = ozaki::config::for_refinement();
+    ozaki::config cfg;
+    cfg.bits     = tuning::current().get("mpir.ozaki.bits",   base.bits);
+    cfg.n_pieces = tuning::current().get("mpir.ozaki.pieces", base.n_pieces);
+    cfg.block    = tuning::current().get("mpir.ozaki.block",  base.block);
+    cfg.n_groups = cfg.n_pieces;
     ozaki::workspace ws(n, k, cfg, prob);
 
     ozaki::row_max(ws.d_mu, st.d_a_hi, n, n, ozaki::shape::full, prob);
