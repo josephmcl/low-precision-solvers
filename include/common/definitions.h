@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+
 #include <cstddef>
 
 /*  Precision tags and the storage each method holds resident.

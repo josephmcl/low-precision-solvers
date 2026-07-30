@@ -1,15 +1,4 @@
-#include "gpu/metrics.h"
-
-#include "gpu/definitions.h"
-#include "gpu/error.h"
-#include "gpu/problem.h"
-
-#include <cuda_runtime.h>
-#include <cublas_v2.h>
-
-#include <cmath>
-#include <cstddef>
-#include <vector>
+#include "common/metrics.h"
 
 namespace metrics {
 

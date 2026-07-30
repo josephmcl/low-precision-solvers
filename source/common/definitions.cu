@@ -1,7 +1,4 @@
-#include "gpu/definitions.h"
-
-#include <algorithm>
-#include <cstddef>
+#include "common/definitions.h"
 
 namespace precision {
 

@@ -31,20 +31,24 @@ NVCCFLAGS := -std=c++17 -O3 $(INCLUDE) \
 LDLIBS    := -lcublas -lcusolver
 
 SRC_DIR   := source/gpu
+COM_DIR   := source/common
+COM_OBJ   := build/common
 TEST_DIR  := test
 OBJ_DIR   := build/gpu
 TOBJ_DIR  := build/test
 BIN_DIR   := bin
 
 COMMON    := \
-	$(OBJ_DIR)/definitions.o \
-	$(OBJ_DIR)/error.o       \
-	$(OBJ_DIR)/timing.o      \
-	$(OBJ_DIR)/tuning.o      \
-	$(OBJ_DIR)/problem.o     \
-	$(OBJ_DIR)/metrics.o     \
-	$(OBJ_DIR)/ozaki.o       \
-	$(OBJ_DIR)/solver.o      \
+	$(COM_OBJ)/definitions.o \
+	$(COM_OBJ)/error.o       \
+	$(COM_OBJ)/timing.o      \
+	$(COM_OBJ)/convert.o     \
+	$(COM_OBJ)/factorize.o   \
+	$(COM_OBJ)/tuning.o      \
+	$(COM_OBJ)/problem.o     \
+	$(COM_OBJ)/metrics.o     \
+	$(COM_OBJ)/ozaki.o       \
+	$(COM_OBJ)/solver.o      \
 	$(OBJ_DIR)/solve_direct.o \
 	$(OBJ_DIR)/solve_split_mpir.o \
 	$(OBJ_DIR)/solve_rir.o \
@@ -67,6 +71,9 @@ $(BIN_DIR)/lps-probe: $(COMMON) $(PROBE_MAIN) | $(BIN_DIR)
 $(BIN_DIR)/lps-ozaki-test: $(COMMON) $(OZTEST_MAIN) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
 
+$(COM_OBJ)/%.o: $(COM_DIR)/%.cu | $(COM_OBJ)
+	$(NVCC) $(NVCCFLAGS) -dc $< -o $@
+
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cu | $(OBJ_DIR)
 	$(NVCC) $(NVCCFLAGS) -dc $< -o $@
 
@@ -76,7 +83,7 @@ $(TOBJ_DIR)/%.o: $(TEST_DIR)/%.cu | $(TOBJ_DIR)
 $(TOBJ_DIR)/%.o: $(TEST_DIR)/%.cpp | $(TOBJ_DIR)
 	$(NVCC) $(NVCCFLAGS) -dc -x cu $< -o $@
 
-$(OBJ_DIR) $(TOBJ_DIR) $(BIN_DIR):
+$(OBJ_DIR) $(COM_OBJ) $(TOBJ_DIR) $(BIN_DIR):
 	mkdir -p $@
 
 clean:

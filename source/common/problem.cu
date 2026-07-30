@@ -1,18 +1,4 @@
-#include "gpu/problem.h"
-
-#include "gpu/definitions.h"
-#include "gpu/error.h"
-#include "gpu/tuning.h"
-
-#include <cuda_runtime.h>
-#include <cublas_v2.h>
-#include <cusolverDn.h>
-
-#include <cmath>
-#include <cstddef>
-#include <iostream>
-#include <string>
-#include <vector>
+#include "common/problem.h"
 
 namespace harness {
 

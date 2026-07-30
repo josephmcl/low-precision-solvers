@@ -1,12 +1,4 @@
-#include "gpu/solver.h"
-
-#include "gpu/error.h"
-#include "gpu/timing.h"
-
-#include <cuda_runtime.h>
-#include <cusolverDn.h>
-
-#include <cstddef>
+#include "common/solver.h"
 
 /*  Reference method: fp64 throughout, cusolverDnDgetrf then Dgetrs.
 

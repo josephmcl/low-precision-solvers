@@ -1,6 +1,6 @@
-#include "gpu/definitions.h"
-#include "gpu/error.h"
-#include "gpu/timing.h"
+#include "common/definitions.h"
+#include "common/error.h"
+#include "common/timing.h"
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>

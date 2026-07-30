@@ -1,17 +1,4 @@
-#include "gpu/ozaki.h"
-
-#include "gpu/definitions.h"
-#include "gpu/error.h"
-#include "gpu/problem.h"
-
-#include <cuda_runtime.h>
-#include <cublas_v2.h>
-
-#include <cmath>
-#include <cstdlib>
-#include <cstddef>
-#include <iostream>
-#include <vector>
+#include "common/ozaki.h"
 
 namespace ozaki {
 

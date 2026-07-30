@@ -1,13 +1,4 @@
-#include "gpu/solver.h"
-
-#include "gpu/definitions.h"
-#include "gpu/error.h"
-
-#include <cuda_runtime.h>
-
-#include <cstddef>
-#include <iostream>
-#include <vector>
+#include "common/solver.h"
 
 namespace solver {
 

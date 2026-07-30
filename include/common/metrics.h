@@ -1,7 +1,14 @@
 #pragma once
 
-#include "gpu/definitions.h"
-#include "gpu/problem.h"
+#include "common/error.h"
+
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include <cmath>
+#include <vector>
+
+#include "common/definitions.h"
+#include "common/problem.h"
 
 #include <cstddef>
 

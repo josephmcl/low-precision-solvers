@@ -1,13 +1,4 @@
-#include "gpu/tuning.h"
-
-#include <algorithm>
-#include <cctype>
-#include <cstdlib>
-#include <fstream>
-#include <iostream>
-#include <sstream>
-#include <string>
-#include <vector>
+#include "common/tuning.h"
 
 namespace tuning {
 

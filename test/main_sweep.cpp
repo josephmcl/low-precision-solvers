@@ -1,10 +1,10 @@
-#include "gpu/definitions.h"
-#include "gpu/error.h"
-#include "gpu/metrics.h"
-#include "gpu/problem.h"
-#include "gpu/solver.h"
-#include "gpu/timing.h"
-#include "gpu/tuning.h"
+#include "common/definitions.h"
+#include "common/error.h"
+#include "common/metrics.h"
+#include "common/problem.h"
+#include "common/solver.h"
+#include "common/timing.h"
+#include "common/tuning.h"
 
 #include <cuda_runtime.h>
 

@@ -1,6 +1,10 @@
 #pragma once
 
-#include "gpu/definitions.h"
+#include "common/error.h"
+
+#include <algorithm>
+
+#include "common/definitions.h"
 
 #include <cuda_runtime.h>
 

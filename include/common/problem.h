@@ -1,6 +1,13 @@
 #pragma once
 
-#include "gpu/definitions.h"
+#include "common/error.h"
+#include "common/tuning.h"
+
+#include <cmath>
+#include <iostream>
+#include <string>
+
+#include "common/definitions.h"
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>

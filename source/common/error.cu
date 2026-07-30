@@ -1,10 +1,4 @@
-#include "gpu/error.h"
-
-#include <cuda_runtime.h>
-#include <cublas_v2.h>
-#include <cusolverDn.h>
-
-#include <iostream>
+#include "common/error.h"
 
 namespace error {
 

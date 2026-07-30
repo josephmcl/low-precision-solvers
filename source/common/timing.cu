@@ -1,14 +1,6 @@
-#include "gpu/timing.h"
-
-#include "gpu/error.h"
-
-#include <cuda_runtime.h>
-
-#include <algorithm>
-#include <vector>
+#include "common/timing.h"
 
 namespace timing {
-
 
 sample summarize(std::vector<double> const &ms) {
 

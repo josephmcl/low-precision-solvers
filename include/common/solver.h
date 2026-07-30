@@ -1,7 +1,18 @@
 #pragma once
 
-#include "gpu/definitions.h"
-#include "gpu/problem.h"
+#include "common/convert.h"
+#include "common/factorize.h"
+#include "common/ozaki.h"
+#include "common/timing.h"
+#include "common/tuning.h"
+
+#include "common/error.h"
+
+#include <cuda_runtime.h>
+#include <iostream>
+
+#include "common/definitions.h"
+#include "common/problem.h"
 
 #include <cstddef>
 #include <vector>
