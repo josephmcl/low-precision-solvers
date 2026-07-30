@@ -46,11 +46,20 @@ class problem {
 
 public:
 
+    /*  shift_override replaces the diagonal shift the matrix_kind would
+        otherwise pick, which is what sets the conditioning: A = rand(-1,1)
+        + shift*I, so large shift is diagonally dominant and shift -> 0
+        approaches singular. Negative means "use the kind's own value".
+
+        Exposed so conditioning can be swept continuously rather than sampled
+        at the four named classes. Where the fp64-free schemes break down as a
+        function of kappa is not answerable from four points. */
     problem(
         std::size_t const  n,
         std::size_t const  k,
         matrix_kind const  kind,
-        unsigned const     seed = 7u);
+        unsigned const     seed = 7u,
+        double const       shift_override = -1.);
 
     ~problem();
 
@@ -85,7 +94,7 @@ private:
 
     std::vector<void *> _d_owned;
 
-    void _generate(unsigned const seed);
+    void _generate(unsigned const seed, double const shift_override);
     void _warm_libraries();
 };
 

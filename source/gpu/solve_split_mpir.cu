@@ -65,6 +65,10 @@ ozaki::config residual_config() {
     cfg.n_pieces   = tuning::current().get("mpir.ozaki.pieces", base.n_pieces);
     cfg.block      = tuning::current().get("mpir.ozaki.block",  base.block);
     cfg.n_groups   = cfg.n_pieces;
+    /*  Read for symmetry with the ablation harness, but inert here: this
+        method's operand is A itself, which has no triangle, so every call
+        below passes shape::full and the switch changes nothing. The triangular
+        path is R-IR's advantage and cannot be taken by an A-based scheme. */
     cfg.triangular =
         tuning::current().get("ozaki.triangular", 1) != 0;
     cfg.contraction_bound =

@@ -95,7 +95,8 @@ problem::problem(
     std::size_t const  n,
     std::size_t const  k,
     matrix_kind const  kind,
-    unsigned const     seed)
+    unsigned const     seed,
+    double const       shift_override)
     : n(n), k(k), kind(kind) {
 
     CUBLAS_CHECK(cublasCreate(&blas));
@@ -110,7 +111,7 @@ problem::problem(
         acquire(static_cast<std::size_t>(launch::MAX_BLOCKS) * sizeof(double)));
     d_residual = static_cast<double *>(acquire(n * k * sizeof(double)));
 
-    _generate(seed);
+    _generate(seed, shift_override);
     _warm_libraries();
 }
 
@@ -135,7 +136,7 @@ void *problem::acquire(std::size_t const bytes) {
     return d_p;
 }
 
-void problem::_generate(unsigned const seed) {
+void problem::_generate(unsigned const seed, double const shift_override) {
 
     /*  The diagonal shift is what sets the conditioning, and with it whether
         the fp32 factorization leaves a small R. */
@@ -148,6 +149,9 @@ void problem::_generate(unsigned const seed) {
         case matrix_kind::near_random:   shift = 1.; break;
         case matrix_kind::graded_rows:   shift = static_cast<double>(n); break;
     }
+
+    if (shift_override >= 0.)
+        shift = shift_override;
 
     generate_matrix_kernel<<<launch::grid_for(n * n), launch::BLOCK_SIZE>>>(
         d_a,

@@ -58,11 +58,12 @@ SWEEP_MAIN  := $(TOBJ_DIR)/main_sweep.o
 PROBE_MAIN  := $(TOBJ_DIR)/main_probe.o
 OZTEST_MAIN := $(TOBJ_DIR)/main_ozaki_test.o
 ABLATE_MAIN := $(TOBJ_DIR)/main_ablate.o
+KAPPA_MAIN  := $(TOBJ_DIR)/main_kappa.o
 
 .PHONY: all clean
 
 all: $(BIN_DIR)/lps-sweep $(BIN_DIR)/lps-probe $(BIN_DIR)/lps-ozaki-test \
-     $(BIN_DIR)/lps-ablate
+     $(BIN_DIR)/lps-ablate $(BIN_DIR)/lps-kappa
 
 $(BIN_DIR)/lps-sweep: $(COMMON) $(SWEEP_MAIN) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
@@ -71,6 +72,9 @@ $(BIN_DIR)/lps-probe: $(COMMON) $(PROBE_MAIN) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
 
 $(BIN_DIR)/lps-ablate: $(COMMON) $(ABLATE_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN_DIR)/lps-kappa: $(COMMON) $(KAPPA_MAIN) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
 
 $(BIN_DIR)/lps-ozaki-test: $(COMMON) $(OZTEST_MAIN) | $(BIN_DIR)
