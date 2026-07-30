@@ -62,6 +62,13 @@ struct state {
     /*  A in fp64, for the methods that keep it resident. */
     double *d_a = nullptr;
 
+    /*  Row permutation from the factorization, composed from getrf's
+        sequential interchanges. Its own member rather than borrowed space in
+        another pointer: the two have different types and different lifetimes,
+        and reusing one for the other is how a harness starts lying about what
+        it holds. */
+    int *d_perm = nullptr;
+
     void *acquire(std::size_t const bytes);
 
 private:
@@ -154,6 +161,15 @@ void solve_direct(
     arithmetic anywhere. 12n^2, same footprint as classical MPIR. */
 void factor_split_mpir(state &st, problem &prob);
 void solve_split_mpir(
+    double       *d_x,
+    double const *d_b,
+    state        &st,
+    problem      &prob);
+
+/*  R-IR: store R = PA - LU instead of A. 8n^2, the only scheme here that does
+    not keep A in any form. */
+void factor_rir(state &st, problem &prob);
+void solve_rir(
     double       *d_x,
     double const *d_b,
     state        &st,

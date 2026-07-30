@@ -72,6 +72,12 @@ std::vector<method> const &registry() {
          nullptr,
          storage::SPLIT_MPIR},
 
+        {"R-IR",
+         factor_rir,
+         solve_rir,
+         nullptr,
+         storage::RIR_FP32_R},
+
         {"vendor IRS fp32",
          nullptr,
          nullptr,
