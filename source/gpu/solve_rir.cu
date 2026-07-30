@@ -45,7 +45,7 @@ using harness::problem;
 
 namespace {
 
-__global__ void demote_kernel(
+__global__ void rir_demote_kernel(
     float             *d_af,
     double const      *d_a,
     std::size_t const  n_total) {
@@ -59,7 +59,7 @@ __global__ void demote_kernel(
 /*  Promote a column block of U out of the packed factor into fp64, so the
     Ozaki product can take it as its right operand. U is the upper triangle
     including the diagonal. */
-__global__ void promote_u_block_kernel(
+__global__ void rir_promote_u_block_kernel(
     double            *d_u,
     float const       *d_lu,
     std::size_t const  n,
@@ -83,11 +83,12 @@ __global__ void promote_u_block_kernel(
 
 /*  R = PA - LU for one column block, written in fp32.
 
-    d_acc already holds -(strict_L * U) for these columns, so adding U back
-    supplies the unit diagonal of L: L*U = strict_L*U + U. PA is read straight
-    out of the reference through the permutation, so no permuted copy of A is
-    ever materialized. */
-__global__ void form_r_block_kernel(
+    d_acc holds strict_L * U for these columns; subtracting U as well supplies
+    L's unit diagonal, since L*U = strict_L*U + U. PA is read straight out of
+    the reference through the permutation, so no permuted copy of A is ever
+    materialized — which matters, because a permuted fp64 copy would cost 8n^2
+    and double the peak footprint this scheme exists to keep small. */
+__global__ void rir_form_r_block_kernel(
     float             *d_r,
     double const      *d_acc,
     float const       *d_lu,
@@ -116,7 +117,7 @@ __global__ void form_r_block_kernel(
     }
 }
 
-__global__ void negate_kernel(
+__global__ void rir_negate_kernel(
     float             *d_m,
     std::size_t const  n_total) {
 
@@ -126,7 +127,7 @@ __global__ void negate_kernel(
         d_m[idx] = -d_m[idx];
 }
 
-__global__ void permute_kernel(
+__global__ void rir_permute_kernel(
     double            *d_out,
     double const      *d_in,
     int const         *d_perm,
@@ -145,7 +146,7 @@ __global__ void permute_kernel(
     }
 }
 
-__global__ void demote_f_kernel(
+__global__ void rir_demote_f_kernel(
     float             *d_out,
     double const      *d_in,
     std::size_t const  n_total) {
@@ -156,7 +157,7 @@ __global__ void demote_f_kernel(
         d_out[idx] = static_cast<float>(d_in[idx]);
 }
 
-__global__ void promote_kernel(
+__global__ void rir_promote_kernel(
     double            *d_out,
     float const       *d_in,
     std::size_t const  n_total) {
@@ -167,7 +168,40 @@ __global__ void promote_kernel(
         d_out[idx] = static_cast<double>(d_in[idx]);
 }
 
-__global__ void subtract_kernel(
+/*  Sum of squares of the difference of two fp64 arrays: the convergence
+    measure for a fixed-point iteration, which yields the ITERATE and not a
+    correction. Testing ||dRHS|| here instead — the natural measure for a
+    correction form — barely moves between passes and fires immediately. */
+__global__ void rir_diff_sq_kernel(
+    double const      *d_x,
+    double const      *d_y,
+    double            *d_partial,
+    std::size_t const  n_total) {
+
+    __shared__ double s[launch::BLOCK_SIZE];
+
+    double acc = 0.;
+    for (std::size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < n_total;
+         idx += static_cast<std::size_t>(blockDim.x) * gridDim.x) {
+        double const v = d_x[idx] - d_y[idx];
+        acc += v * v;
+    }
+
+    s[threadIdx.x] = acc;
+    __syncthreads();
+
+    for (int q = launch::BLOCK_SIZE / 2; q > 0; q >>= 1) {
+        if (static_cast<int>(threadIdx.x) < q)
+            s[threadIdx.x] += s[threadIdx.x + q];
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0)
+        d_partial[blockIdx.x] = s[0];
+}
+
+__global__ void rir_subtract_kernel(
     double            *d_x,
     double const      *d_y,
     std::size_t const  n_total) {
@@ -178,7 +212,7 @@ __global__ void subtract_kernel(
         d_x[idx] -= d_y[idx];
 }
 
-__global__ void add_f32_kernel(
+__global__ void rir_add_f32_kernel(
     double            *d_x,
     float const       *d_d,
     std::size_t const  n_total) {
@@ -189,8 +223,33 @@ __global__ void add_f32_kernel(
         d_x[idx] += static_cast<double>(d_d[idx]);
 }
 
+double rir_diff_norm(
+    double const      *d_x,
+    double const      *d_y,
+    std::size_t const  n_total,
+    problem           &prob) {
+
+    int const n_blocks = launch::grid_for(n_total);
+
+    rir_diff_sq_kernel<<<n_blocks, launch::BLOCK_SIZE>>>(
+        d_x, d_y, prob.d_partial, n_total);
+    KERNEL_CHECK();
+
+    std::vector<double> partial(static_cast<std::size_t>(n_blocks));
+    CUDA_CHECK(cudaMemcpy(
+        partial.data(), prob.d_partial,
+        static_cast<std::size_t>(n_blocks) * sizeof(double),
+        cudaMemcpyDeviceToHost));
+
+    double total = 0.;
+    for (std::size_t i = 0; i != partial.size(); ++i)
+        total += partial[i];
+
+    return total;
+}
+
 /*  Both triangular solves of the packed factor, in fp32, in place. */
-void lu_solve_f32(
+void rir_lu_solve_f32(
     float             *d_y,
     float const       *d_lu,
     std::size_t const  n,
@@ -269,7 +328,7 @@ void factor_rir(state &st, problem &prob) {
     timing::stopwatch watch;
     watch.start();
 
-    demote_kernel<<<launch::grid_for(nn), launch::BLOCK_SIZE>>>(
+    rir_demote_kernel<<<launch::grid_for(nn), launch::BLOCK_SIZE>>>(
         st.d_lu, prob.d_a, nn);
     KERNEL_CHECK();
 
@@ -302,7 +361,7 @@ void factor_rir(state &st, problem &prob) {
 
         std::size_t const n_c = std::min(nb, n - j);
 
-        promote_u_block_kernel<<<launch::grid_for(n * n_c),
+        rir_promote_u_block_kernel<<<launch::grid_for(n * n_c),
                                  launch::BLOCK_SIZE>>>(
             d_u, st.d_lu, n, j, n_c);
         KERNEL_CHECK();
@@ -313,7 +372,7 @@ void factor_rir(state &st, problem &prob) {
         ozaki::accumulate_product(
             d_acc, st.d_lu, d_u, n, n_c, ozaki::shape::lower, ws, prob);
 
-        form_r_block_kernel<<<launch::grid_for(n * n_c),
+        rir_form_r_block_kernel<<<launch::grid_for(n * n_c),
                               launch::BLOCK_SIZE>>>(
             st.d_r, d_acc, st.d_lu, prob.d_a, d_perm, n, j, n_c);
         KERNEL_CHECK();
@@ -336,7 +395,8 @@ void solve_rir(
 
     int *d_perm = st.d_perm;
 
-    double *d_pb  = static_cast<double *>(st.acquire(nk * sizeof(double)));
+    double *d_pb   = static_cast<double *>(st.acquire(nk * sizeof(double)));
+    double *d_prev = static_cast<double *>(st.acquire(nk * sizeof(double)));
     double *d_rhs = static_cast<double *>(st.acquire(nk * sizeof(double)));
     float  *d_y   = static_cast<float *>(st.acquire(nk * sizeof(float)));
 
@@ -346,13 +406,13 @@ void solve_rir(
     /*  R*X never cancels — R is already ~2^-24 of A — which is the structural
         reason this form needs no fp64. Negated once so the residual is an
         accumulate rather than a subtract. */
-    negate_kernel<<<launch::grid_for(n * n), launch::BLOCK_SIZE>>>(
+    rir_negate_kernel<<<launch::grid_for(n * n), launch::BLOCK_SIZE>>>(
         st.d_r, n * n);
     KERNEL_CHECK();
 
     ozaki::row_max(ws.d_mu, st.d_r, n, n, ozaki::shape::full, prob);
 
-    permute_kernel<<<launch::grid_for(nk), launch::BLOCK_SIZE>>>(
+    rir_permute_kernel<<<launch::grid_for(nk), launch::BLOCK_SIZE>>>(
         d_pb, d_b, d_perm, n, k);
     KERNEL_CHECK();
 
@@ -363,7 +423,11 @@ void solve_rir(
     watch.start();
 
     std::size_t used = 0;
-    std::size_t const cap = 6;
+    double previous = 0., first = 0.;
+
+    /*  A cap, not a schedule: the loop stops on the test below and reports
+        what it used. */
+    std::size_t const cap = 8;
 
     for (std::size_t it = 0; it != cap; ++it) {
 
@@ -377,17 +441,35 @@ void solve_rir(
                 d_rhs, st.d_r, d_x, n, k, ozaki::shape::full, ws, prob);
         }
 
-        demote_f_kernel<<<launch::grid_for(nk), launch::BLOCK_SIZE>>>(
+        rir_demote_f_kernel<<<launch::grid_for(nk), launch::BLOCK_SIZE>>>(
             d_y, d_rhs, nk);
         KERNEL_CHECK();
 
-        lu_solve_f32(d_y, st.d_lu, n, k, prob);
+        rir_lu_solve_f32(d_y, st.d_lu, n, k, prob);
 
-        promote_kernel<<<launch::grid_for(nk), launch::BLOCK_SIZE>>>(
+        CUDA_CHECK(cudaMemcpy(
+            d_prev, d_x, nk * sizeof(double), cudaMemcpyDeviceToDevice));
+        rir_promote_kernel<<<launch::grid_for(nk), launch::BLOCK_SIZE>>>(
             d_x, d_y, nk);
         KERNEL_CHECK();
 
         ++used;
+
+        /*  Two tests, because either alone fails. The fixed point converges at
+            rho ~ 1e-7 and can reach dX == 0 exactly, after which a
+            stall-ratio test never fires again; and a pure tolerance test never
+            fires on a problem that plateaus above it. Three wrong stopping
+            rules in earlier work came from having only one of the two. */
+        double const current = rir_diff_norm(d_x, d_prev, nk, prob);
+        if (it == 0)
+            first = current;
+        else {
+            bool const stalled   = current > 0.25 * previous;
+            bool const converged = current <= 1e-24 * first;
+            if (stalled || converged)
+                break;
+        }
+        previous = current;
     }
 
     /*  The fixed-point form hands the LU solve straight to the iterate, so the
@@ -410,14 +492,14 @@ void solve_rir(
             d_t, st.d_lu, d_x, n, k, ozaki::shape::upper, ws, prob);
 
         /*  d = rhs - L*t, with L's unit diagonal supplying -t. */
-        negate_kernel<<<launch::grid_for(n * n), launch::BLOCK_SIZE>>>(
+        rir_negate_kernel<<<launch::grid_for(n * n), launch::BLOCK_SIZE>>>(
             st.d_lu, n * n);
         KERNEL_CHECK();
         ozaki::row_max(ws.d_mu, st.d_lu, n, n, ozaki::shape::lower, prob);
         ozaki::column_max(ws.d_nu, d_t, n, k, prob);
         ozaki::accumulate_product(
             d_rhs, st.d_lu, d_t, n, k, ozaki::shape::lower, ws, prob);
-        negate_kernel<<<launch::grid_for(n * n), launch::BLOCK_SIZE>>>(
+        rir_negate_kernel<<<launch::grid_for(n * n), launch::BLOCK_SIZE>>>(
             st.d_lu, n * n);
         KERNEL_CHECK();
 
@@ -425,17 +507,17 @@ void solve_rir(
             unit diagonal, then solve and correct. */
         /*  A kernel rather than Daxpy: n*k exceeds INT_MAX before the
             problem exceeds device memory, and the cuBLAS signature takes int. */
-        subtract_kernel<<<launch::grid_for(nk), launch::BLOCK_SIZE>>>(
+        rir_subtract_kernel<<<launch::grid_for(nk), launch::BLOCK_SIZE>>>(
             d_rhs, d_t, nk);
         KERNEL_CHECK();
 
-        demote_f_kernel<<<launch::grid_for(nk), launch::BLOCK_SIZE>>>(
+        rir_demote_f_kernel<<<launch::grid_for(nk), launch::BLOCK_SIZE>>>(
             d_y, d_rhs, nk);
         KERNEL_CHECK();
 
-        lu_solve_f32(d_y, st.d_lu, n, k, prob);
+        rir_lu_solve_f32(d_y, st.d_lu, n, k, prob);
 
-        add_f32_kernel<<<launch::grid_for(nk), launch::BLOCK_SIZE>>>(
+        rir_add_f32_kernel<<<launch::grid_for(nk), launch::BLOCK_SIZE>>>(
             d_x, d_y, nk);
         KERNEL_CHECK();
     }
@@ -443,7 +525,7 @@ void solve_rir(
     st.solve_ms     = watch.stop();
     st.n_iterations = used;
 
-    negate_kernel<<<launch::grid_for(n * n), launch::BLOCK_SIZE>>>(
+    rir_negate_kernel<<<launch::grid_for(n * n), launch::BLOCK_SIZE>>>(
         st.d_r, n * n);
     KERNEL_CHECK();
 }

@@ -167,6 +167,10 @@ int main(int argc, char **argv) {
             std::size_t         n_iterations = 0;
             bool                split        = false;
 
+            /*  Progress to stderr, unbuffered, so a crash localizes to a
+                method instead of losing the whole buffered table. */
+            std::cerr << "    [running " << m.name << "]" << std::endl;
+
             /*  One untimed run first, discarded.
 
                 A library warmup on a small problem is not sufficient: cuSOLVER
