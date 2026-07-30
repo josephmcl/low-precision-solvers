@@ -354,19 +354,23 @@ void accumulate_product(
     std::size_t const  n_rhs,
     shape const        which,
     workspace         &ws,
-    problem           &prob) {
+    problem           &prob,
+    std::size_t const  contraction_limit) {
 
     std::size_t const n  = prob.n;
     config     const &cfg = ws.cfg;
+
+    std::size_t const k_end =
+        (contraction_limit == 0 || contraction_limit > n)? n : contraction_limit;
 
     std::size_t const b  = static_cast<std::size_t>(cfg.block);
     std::size_t const np = static_cast<std::size_t>(cfg.n_pieces);
 
     float const one = 1.f, zero = 0.f;
 
-    for (std::size_t c_0 = 0; c_0 < n; c_0 += b) {
+    for (std::size_t c_0 = 0; c_0 < k_end; c_0 += b) {
 
-        std::size_t const n_c = (n - c_0 < b)? n - c_0 : b;
+        std::size_t const n_c = (k_end - c_0 < b)? k_end - c_0 : b;
 
         /*  Rows of the output this contraction block can touch. For L
             (strictly lower) columns c only feed rows > c, so rows below c_0

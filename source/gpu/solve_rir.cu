@@ -370,8 +370,12 @@ void factor_rir(state &st, problem &prob) {
         ozaki::column_max(ws.d_nu, d_u, n, n_c, prob);
 
         CUDA_CHECK(cudaMemset(d_acc, 0, n * n_c * sizeof(double)));
+        /*  Only contraction indices below j + n_c reach these columns: U is
+            upper triangular, so its rows at or beyond that are zero here.
+            Bounding the loop halves the build. */
         ozaki::accumulate_product(
-            d_acc, st.d_lu, d_u, n, n_c, ozaki::shape::lower, ws, prob);
+            d_acc, st.d_lu, d_u, n, n_c, ozaki::shape::lower, ws, prob,
+            j + n_c);
 
         rir_form_r_block_kernel<<<launch::grid_for(n * n_c),
                               launch::BLOCK_SIZE>>>(

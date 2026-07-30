@@ -98,6 +98,13 @@ bool table::_load(std::string const &path) {
 
 void table::load(std::string const &device_name) {
 
+    /*  Idempotent. load() runs once per problem, and a sweep constructs one
+        problem per k, so appending would leave three copies of every key with
+        only the first matched by get() — which then reports the other two as
+        never read. Clearing makes repeated loads a no-op rather than a slow
+        accumulation of shadowed duplicates. */
+    _entries.clear();
+
     if (char const *explicit_path = std::getenv("LPS_TUNING")) {
         if (_load(explicit_path))
             return;

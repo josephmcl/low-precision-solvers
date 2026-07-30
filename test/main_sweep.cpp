@@ -145,13 +145,8 @@ int main(int argc, char **argv) {
             bit-identical A and B. */
         harness::problem prob(opt.n, k, opt.kind);
 
-        if (ki == 0) {
+        if (ki == 0)
             std::cout << "tuning   " << tuning::current().source() << "\n\n";
-            std::vector<std::string> const stale = tuning::current().unused();
-            for (std::size_t i = 0; i != stale.size(); ++i)
-                std::cout << "[tuning] key never read: " << stale[i]
-                          << " (typo, or a parameter that no longer exists)\n";
-        }
 
         double *d_x = static_cast<double *>(
             prob.acquire(opt.n * k * sizeof(double)));
@@ -268,6 +263,14 @@ int main(int argc, char **argv) {
 
         std::cout << "\n";
     }
+
+    /*  Stale keys are reported at the END: a key counts as unread only once
+        every method has had its chance to ask for it. Checking at load time
+        flags every key in the file, which is worse than not checking. */
+    std::vector<std::string> const stale = tuning::current().unused();
+    for (std::size_t i = 0; i != stale.size(); ++i)
+        std::cout << "[tuning] key never read: " << stale[i]
+                  << " (typo, or a parameter that no longer exists)\n";
 
     return 0;
 }
