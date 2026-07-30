@@ -98,5 +98,9 @@ $(OBJ_DIR) $(COM_OBJ) $(TOBJ_DIR) $(BIN_DIR):
 clean:
 	rm -rf build $(BIN_DIR)
 
--include $(COMMON:.o=.d)
--include $(SWEEP_MAIN:.o=.d) $(PROBE_MAIN:.o=.d) $(OZTEST_MAIN:.o=.d)
+# Wildcard, not an enumeration of targets. Listing them by name means every
+# new binary silently loses header dependency tracking until someone remembers
+# to add it here — which happened, and presented as a link error against a
+# constructor signature that had changed three files away. Any .d that exists
+# gets included, so a new target is covered the moment it first compiles.
+-include $(wildcard $(COM_OBJ)/*.d $(OBJ_DIR)/*.d $(TOBJ_DIR)/*.d)
