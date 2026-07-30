@@ -39,6 +39,7 @@ COMMON    := \
 	$(OBJ_DIR)/solver.o      \
 	$(OBJ_DIR)/solve_direct.o \
 	$(OBJ_DIR)/solve_split_mpir.o \
+	$(OBJ_DIR)/solve_rir.o \
 	$(OBJ_DIR)/factor_solve_vendor_irs.o
 
 SWEEP_MAIN  := $(TOBJ_DIR)/main_sweep.o
