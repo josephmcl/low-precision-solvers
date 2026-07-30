@@ -249,15 +249,37 @@ double rir_diff_norm(
     return total;
 }
 
-/*  Both triangular solves of the packed factor, in fp32, in place. */
+/*  Both triangular solves of the packed factor, in place.
+
+    tf32 lowers the solve to tensor-core precision, which is correct ONLY for
+    the outer iterations: they converge the fixed point at rho ~ 1e-7, so their
+    precision does not reach the answer — the final refinement's correction
+    solve sets that. Running the refinement itself in tf32 would degrade the
+    result directly.
+
+    Scoped and restored around each call rather than set once on the handle.
+    Setting this mode globally silently degraded every Sgemm and Strsm in
+    earlier work and cost a round of misdiagnosis; the mode is a property of
+    the call site, not of the solver.
+
+    This lever is specific to the fixed-point form. A correction-form method
+    has no solve whose only job is to be approximately right — its triangular
+    solves produce the correction itself — so it cannot take this. */
 void rir_lu_solve_f32(
     float             *d_y,
     float const       *d_lu,
     std::size_t const  n,
     std::size_t const  k,
-    problem           &prob) {
+    problem           &prob,
+    bool const         tf32) {
 
     float const one = 1.f;
+
+    cublasMath_t previous_mode = CUBLAS_DEFAULT_MATH;
+    if (tf32) {
+        CUBLAS_CHECK(cublasGetMathMode(prob.blas, &previous_mode));
+        CUBLAS_CHECK(cublasSetMathMode(prob.blas, CUBLAS_TF32_TENSOR_OP_MATH));
+    }
 
     CUBLAS_CHECK(cublasStrsm(
         prob.blas,
@@ -274,6 +296,9 @@ void rir_lu_solve_f32(
         static_cast<int>(n), static_cast<int>(k),
         &one, d_lu, static_cast<int>(n),
         d_y, static_cast<int>(n)));
+
+    if (tf32)
+        CUBLAS_CHECK(cublasSetMathMode(prob.blas, previous_mode));
 }
 
 } /* namespace */
@@ -432,12 +457,18 @@ void solve_rir(
     timing::stopwatch watch;
     watch.start();
 
+    bool const tf32_outer =
+        tuning::current().get("rir.solve.tf32_outer", 0) != 0;
+
     std::size_t used = 0;
     double previous = 0., first = 0.;
 
     /*  A cap, not a schedule: the loop stops on the test below and reports
-        what it used. */
-    std::size_t const cap = 8;
+        what it used. Exposed only so the stopping rule itself can be checked
+        against a forced count — if capping below the converged count does not
+        change the answer, the extra passes were doing nothing. */
+    std::size_t const cap = static_cast<std::size_t>(
+        tuning::current().get("rir.solve.max_outer", 8));
 
     for (std::size_t it = 0; it != cap; ++it) {
 
@@ -455,7 +486,7 @@ void solve_rir(
             d_y, d_rhs, nk);
         KERNEL_CHECK();
 
-        rir_lu_solve_f32(d_y, st.d_lu, n, k, prob);
+        rir_lu_solve_f32(d_y, st.d_lu, n, k, prob, tf32_outer);
 
         CUDA_CHECK(cudaMemcpy(
             d_prev, d_x, nk * sizeof(double), cudaMemcpyDeviceToDevice));
@@ -474,8 +505,15 @@ void solve_rir(
         if (it == 0)
             first = current;
         else {
+            /*  Both norms are SUMS OF SQUARES, so a tolerance here is the
+                square of the one in norm terms: 1e-20 means ||dX|| has fallen
+                to 1e-10 of its first step. Measured, that stops at 3 passes
+                with the same answer 4 gave (4.32e-16 either way, 22.6 ms
+                cheaper); the tighter 1e-24 bought an extra pass that changed
+                nothing. Two passes is genuinely worse (5.33e-16), so 3 is the
+                floor, not a guess. */
             bool const stalled   = current > 0.25 * previous;
-            bool const converged = current <= 1e-24 * first;
+            bool const converged = current <= 1e-20 * first;
             if (stalled || converged)
                 break;
         }
@@ -525,7 +563,9 @@ void solve_rir(
             d_y, d_rhs, nk);
         KERNEL_CHECK();
 
-        rir_lu_solve_f32(d_y, st.d_lu, n, k, prob);
+        /*  fp32, never tf32: this solve produces the correction that sets the
+            delivered accuracy. */
+        rir_lu_solve_f32(d_y, st.d_lu, n, k, prob, false);
 
         rir_add_f32_kernel<<<launch::grid_for(nk), launch::BLOCK_SIZE>>>(
             d_x, d_y, nk);
