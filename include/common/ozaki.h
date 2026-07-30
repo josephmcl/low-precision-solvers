@@ -120,10 +120,15 @@ struct config {
         merging everything from s=3 and measured it slightly MORE accurate, not
         less. n_groups disables merging.
 
-        This is the one lever left on the accumulator traffic, which the column
-        block sweep showed dominates the R build: it turns n_groups fp64 passes
-        per contraction block into merge_tail+1. */
-    int merge_tail = 3;
+        DEFAULTS TO OFF (-1 = keep every group separate), and must be opted
+        into per site. Merging is only safe where the *consumer* of the product
+        is coarser than the damage it does: R-IR tolerates it because R is then
+        stored in fp32, which is coarser still. Measured on the raw L*U product
+        it costs 15x at 6 pieces and 13000x at 9 — degradation that is real but
+        invisible downstream, which is exactly the kind of default that ships a
+        silent four-order regression to whoever builds a config by hand. Worth
+        1-2% when it applies. */
+    int merge_tail = -1;
 
     /*  Products actually issued: n_groups*(n_groups+1)/2. */
     int n_products() const {return n_groups * (n_groups + 1) / 2;}
