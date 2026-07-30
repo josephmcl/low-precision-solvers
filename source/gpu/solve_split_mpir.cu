@@ -120,7 +120,7 @@ void solve_split_mpir(
     ozaki::config const cfg = residual_config();
     ozaki::workspace ws(n, k, cfg, prob);
 
-    ozaki::row_max(ws.d_mu, st.d_a_hi, n, n, ozaki::shape::full, prob);
+    ozaki::row_max(ws.d_mu, st.d_a_hi, ozaki::format::fp32, n, n, ozaki::shape::full, prob);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     timing::stopwatch watch;

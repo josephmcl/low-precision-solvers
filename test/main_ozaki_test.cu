@@ -187,7 +187,7 @@ int main(int argc, char **argv) {
 
             CUDA_CHECK(cudaMemset(d_acc, 0, n * k * sizeof(double)));
 
-            ozaki::row_max(ws.d_mu, d_af, n, n, which, prob);
+            ozaki::row_max(ws.d_mu, d_af, ozaki::format::fp32, n, n, which, prob);
             ozaki::column_max(ws.d_nu, prob.d_b, n, k, prob);
             CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -293,7 +293,7 @@ int main(int argc, char **argv) {
             cfg.n_groups = cases[ci].pieces; cfg.block = cases[ci].block;
 
             ozaki::workspace ws2(n, n, cfg, prob);
-            ozaki::row_max(ws2.d_mu, d_lu, n, n, ozaki::shape::lower, prob);
+            ozaki::row_max(ws2.d_mu, d_lu, ozaki::format::fp32, n, n, ozaki::shape::lower, prob);
             ozaki::column_max(ws2.d_nu, d_u, n, n, prob);
             CUDA_CHECK(cudaDeviceSynchronize());
 

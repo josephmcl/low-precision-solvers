@@ -1,5 +1,7 @@
 #include "common/ozaki.h"
 
+#include <cuda_bf16.h>
+
 namespace ozaki {
 
 using harness::problem;
@@ -62,6 +64,98 @@ config from_environment() {
     return cfg;
 }
 
+std::size_t bytes_of(format const f) {
+
+    switch (f) {
+        case format::fp32: return 4;
+        case format::b24:  return 3;
+        case format::bf16: return 2;
+    }
+    return 4;
+}
+
+/*  Read one element of a packed array as fp32. b24 keeps the top three bytes
+    of the fp32 word, so unpacking is a shift; bf16 keeps the top two. */
+template <format F>
+__device__ __forceinline__ float read_packed(
+    void const        *d_a,
+    std::size_t const  idx) {
+
+    if (F == format::fp32)
+        return static_cast<float const *>(d_a)[idx];
+
+    if (F == format::bf16)
+        return __bfloat162float(
+            static_cast<__nv_bfloat16 const *>(d_a)[idx]);
+
+    unsigned char const *b =
+        static_cast<unsigned char const *>(d_a) + 3 * idx;
+    unsigned const bits =
+        (static_cast<unsigned>(b[0]) << 8)  |
+        (static_cast<unsigned>(b[1]) << 16) |
+        (static_cast<unsigned>(b[2]) << 24);
+    return __uint_as_float(bits);
+}
+
+/*  Round-to-nearest into the packed format. The bias added before truncation
+    is what makes this rounding rather than truncation — truncating instead
+    biases every element toward zero, which on a residual matrix is a
+    systematic error rather than a random one. */
+template <format F>
+__global__ void compress_kernel(
+    void              *d_out,
+    float const       *d_in,
+    std::size_t const  n_elements) {
+
+    for (std::size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < n_elements;
+         idx += static_cast<std::size_t>(blockDim.x) * gridDim.x) {
+
+        float const v = d_in[idx];
+
+        if (F == format::fp32) {
+            static_cast<float *>(d_out)[idx] = v;
+        }
+        else if (F == format::bf16) {
+            static_cast<__nv_bfloat16 *>(d_out)[idx] = __float2bfloat16(v);
+        }
+        else {
+            unsigned bits = __float_as_uint(v);
+            unsigned const lsb = (bits >> 8) & 1u;
+            bits += 0x7Fu + lsb;                 /* round to nearest even */
+            unsigned char *b =
+                static_cast<unsigned char *>(d_out) + 3 * idx;
+            b[0] = static_cast<unsigned char>((bits >> 8)  & 0xFFu);
+            b[1] = static_cast<unsigned char>((bits >> 16) & 0xFFu);
+            b[2] = static_cast<unsigned char>((bits >> 24) & 0xFFu);
+        }
+    }
+}
+
+void compress(
+    void              *d_out,
+    float const       *d_in,
+    std::size_t const  n_elements,
+    format const       f,
+    problem           &prob) {
+
+    (void) prob;
+    int const g = launch::grid_for(n_elements);
+
+    switch (f) {
+        case format::fp32:
+            compress_kernel<format::fp32><<<g, launch::BLOCK_SIZE>>>(
+                d_out, d_in, n_elements); break;
+        case format::b24:
+            compress_kernel<format::b24><<<g, launch::BLOCK_SIZE>>>(
+                d_out, d_in, n_elements); break;
+        case format::bf16:
+            compress_kernel<format::bf16><<<g, launch::BLOCK_SIZE>>>(
+                d_out, d_in, n_elements); break;
+    }
+    KERNEL_CHECK();
+}
+
 /*  ---- scale factors ---------------------------------------------------- */
 
 /*  Largest |a| in each row of the requested triangle. One block per row: the
@@ -69,9 +163,10 @@ config from_environment() {
 
     Full rows, not per block, because the exponent grid must be constant along
     the summed index (see the header). */
+template <format F>
 __global__ void row_max_kernel(
     float             *d_mu,
-    float const       *d_a,
+    void const        *d_a,
     std::size_t const  n,
     std::size_t const  lda,
     int const          which) {
@@ -87,8 +182,7 @@ __global__ void row_max_kernel(
         if (which == 1 && j >= i) continue;
         if (which == 2 && j <  i) continue;
 
-        float const v = fabsf(d_a[i + j * lda]);
-        acc = fmaxf(acc, v);
+        acc = fmaxf(acc, fabsf(read_packed<F>(d_a, i + j * lda)));
     }
 
     s[threadIdx.x] = acc;
@@ -140,7 +234,8 @@ __global__ void column_max_kernel(
 
 void row_max(
     float             *d_mu,
-    float const       *d_a,
+    void const        *d_a,
+    format const       f,
     std::size_t const  n,
     std::size_t const  lda,
     shape const        which,
@@ -148,12 +243,20 @@ void row_max(
 
     (void) prob;
 
-    row_max_kernel<<<static_cast<int>(n), launch::BLOCK_SIZE>>>(
-        d_mu,
-        d_a,
-        n,
-        lda,
-        static_cast<int>(which));
+    int const g = static_cast<int>(n);
+    int const w = static_cast<int>(which);
+
+    switch (f) {
+        case format::fp32:
+            row_max_kernel<format::fp32><<<g, launch::BLOCK_SIZE>>>(
+                d_mu, d_a, n, lda, w); break;
+        case format::b24:
+            row_max_kernel<format::b24><<<g, launch::BLOCK_SIZE>>>(
+                d_mu, d_a, n, lda, w); break;
+        case format::bf16:
+            row_max_kernel<format::bf16><<<g, launch::BLOCK_SIZE>>>(
+                d_mu, d_a, n, lda, w); break;
+    }
     KERNEL_CHECK();
 }
 
@@ -181,9 +284,10 @@ void column_max(
     per row, and threads in a block span rows, so the exp2f cannot be hoisted
     here — it can in the X split below, where the scale is per column, and
     that hoist is worth 3x. */
+template <format F>
 __global__ void split_a_kernel(
     float             *d_pieces,
-    float const       *d_a,
+    void const        *d_a,
     float const       *d_mu,
     std::size_t const  lda,
     std::size_t const  stride,
@@ -209,7 +313,7 @@ __global__ void split_a_kernel(
     if (which == 1 && j >= i) live = false;   /* strictly lower */
     if (which == 2 && j <  i) live = false;   /* on and above   */
     if (live)
-        a = d_a[i + j * lda];
+        a = read_packed<F>(d_a, i + j * lda);
 
     int const e = ilogbf(d_mu[i]);
 
@@ -351,14 +455,15 @@ static int stop_after() {
 
 void accumulate_product(
     double            *d_acc,
-    float const       *d_a,
+    void const        *d_a,
     double const      *d_x,
     std::size_t const  lda,
     std::size_t const  n_rhs,
     shape const        which,
     workspace         &ws,
     problem           &prob,
-    std::size_t const  contraction_limit) {
+    std::size_t const  contraction_limit,
+    format const       a_format) {
 
     std::size_t const n  = prob.n;
     config     const &cfg = ws.cfg;
@@ -397,19 +502,23 @@ void accumulate_product(
             static_cast<unsigned>((n_rows + launch::BLOCK_SIZE - 1) /
                                   launch::BLOCK_SIZE),
             static_cast<unsigned>(n_c));
-        split_a_kernel<<<grid_a, launch::BLOCK_SIZE>>>(
-            ws.d_pieces_a,
-            d_a,
-            ws.d_mu,
-            lda,
-            stride_a,
-            n_rows,
-            row_0,
-            c_0,
-            n_c,
-            cfg.n_pieces,
-            cfg.bits,
-            static_cast<int>(which));
+        switch (a_format) {
+            case format::fp32:
+                split_a_kernel<format::fp32><<<grid_a, launch::BLOCK_SIZE>>>(
+                    ws.d_pieces_a, d_a, ws.d_mu, lda, stride_a, n_rows,
+                    row_0, c_0, n_c, cfg.n_pieces, cfg.bits,
+                    static_cast<int>(which)); break;
+            case format::b24:
+                split_a_kernel<format::b24><<<grid_a, launch::BLOCK_SIZE>>>(
+                    ws.d_pieces_a, d_a, ws.d_mu, lda, stride_a, n_rows,
+                    row_0, c_0, n_c, cfg.n_pieces, cfg.bits,
+                    static_cast<int>(which)); break;
+            case format::bf16:
+                split_a_kernel<format::bf16><<<grid_a, launch::BLOCK_SIZE>>>(
+                    ws.d_pieces_a, d_a, ws.d_mu, lda, stride_a, n_rows,
+                    row_0, c_0, n_c, cfg.n_pieces, cfg.bits,
+                    static_cast<int>(which)); break;
+        }
         KERNEL_CHECK();
 
         dim3 const grid_x(

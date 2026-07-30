@@ -49,6 +49,13 @@ struct state {
 
         A split method fills factor_ms and solve_ms. A monolithic one fills
         total_ms only and leaves the other two at zero; see `method`. */
+    /*  Matrix-resident bytes per n^2, when the method's storage depends on a
+        runtime choice rather than the fixed value in its registry entry. Zero
+        means "use the registry value". Reported rather than assumed, so a
+        capacity claim always matches the configuration that produced the
+        timings beside it. */
+    double      storage_n2   = 0.;
+
     double      factor_ms    = 0.;
     double      solve_ms     = 0.;
     double      total_ms     = 0.;
@@ -63,8 +70,11 @@ struct state {
     float *d_lu   = nullptr;
     int   *d_ipiv = nullptr;
 
-    /*  R = PA - LU, the residual-storage scheme's matrix. */
-    float *d_r = nullptr;
+    /*  R = PA - LU, the residual-storage scheme's matrix. Void because its
+        element width is a tunable: fp32, 24-bit or bf16, giving 8n^2, 7n^2 or
+        6n^2 total. See ozaki::format. */
+    void         *d_r = nullptr;
+    ozaki::format r_format = ozaki::format::fp32;
 
     /*  A as an unevaluated sum of two fp32 words, for the split residual. */
     float *d_a_hi = nullptr;

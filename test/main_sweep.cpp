@@ -182,6 +182,7 @@ int main(int argc, char **argv) {
             std::vector<double> solve;
             std::size_t         n_iterations = 0;
             bool                split        = false;
+            double              storage      = 0.;
 
             /*  Progress to stderr, unbuffered, so a crash localizes to a
                 method instead of losing the whole buffered table. */
@@ -217,7 +218,8 @@ int main(int argc, char **argv) {
                     is itself a result worth seeing. */
                 if (st.n_iterations > n_iterations)
                     n_iterations = st.n_iterations;
-                split = st.split_reported;
+                split   = st.split_reported;
+                storage = st.storage_n2;
             }
 
             if (opt.raw) {
@@ -262,7 +264,7 @@ int main(int argc, char **argv) {
                       << std::setw(12) << err.relative
                       << std::setw(12) << err.forward
                       << std::setw(7) << std::fixed << std::setprecision(0)
-                      << m.storage_n2 << "n2"
+                      << ((storage > 0.)? storage : m.storage_n2) << "n2"
                       << "\n";
         }
 

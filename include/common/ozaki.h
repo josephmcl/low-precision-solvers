@@ -71,6 +71,35 @@ using harness::problem;
     ~1.4x on the residual-storage method's refinement, and it is the one
     arithmetic advantage that method has which the dense baselines cannot
     also take. */
+/*  How the fp32-side operand is stored.
+
+    R = PA - LU is the only array here worth compressing, and it is the whole
+    point of the scheme: storage identity bits(eps) = bits(u_f) + bits(u_R)
+    says the accuracy follows the TOTAL bits kept, so trading R's width against
+    problem size is a dial rather than a compromise. fp32 R gives 8n^2 total,
+    b24 gives 7n^2, bf16 gives 6n^2.
+
+    b24 is sign + 8 exponent + 15 mantissa packed into three bytes. Note that
+    is 15 mantissa bits, not the 20 an earlier projection assumed — 1+8+20 is
+    29 bits and does not fit in three bytes. The accuracy has to be measured at
+    15, not carried over from a 20-bit truncation experiment. */
+enum class format {
+    fp32,
+    b24,
+    bf16
+};
+
+std::size_t bytes_of(format const f);
+
+/*  Round an fp32 array into `f`, in place-compatible layout (the destination
+    may alias nothing; sizes differ). Used once, when R is formed. */
+void compress(
+    void              *d_out,
+    float const       *d_in,
+    std::size_t const  n_elements,
+    format const       f,
+    problem           &prob);
+
 enum class shape {
     full,
     lower,   /* unit-diagonal L out of a packed factor */
@@ -269,7 +298,8 @@ private:
     the grid argument above requires. */
 void row_max(
     float             *d_mu,
-    float const       *d_a,
+    void const        *d_a,
+    format const       f,
     std::size_t const  n,
     std::size_t const  lda,
     shape const        which,
@@ -305,13 +335,14 @@ void column_max(
     blocks the useful part is n^2/2 against n^2. */
 void accumulate_product(
     double            *d_acc,
-    float const       *d_a,
+    void const        *d_a,
     double const      *d_x,
     std::size_t const  lda,
     std::size_t const  n_rhs,
     shape const        which,
     workspace         &ws,
     problem           &prob,
-    std::size_t const  contraction_limit = 0);
+    std::size_t const  contraction_limit = 0,
+    format const       a_format = format::fp32);
 
 } /* namespace ozaki */

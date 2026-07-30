@@ -86,7 +86,7 @@ __global__ void form_r_block_kernel(
         double const u  = (i <= j)? static_cast<double>(d_lu[i + j * n]) : 0.;
         double const pa = d_a[static_cast<std::size_t>(d_perm[i]) + j * n];
 
-        d_r[i + j * n] = static_cast<float>(pa - d_acc[idx] - u);
+        d_r[idx] = static_cast<float>(pa - d_acc[idx] - u);
     }
 }
 
@@ -118,8 +118,22 @@ void factor_rir(state &st, problem &prob) {
     std::size_t const n  = prob.n;
     std::size_t const nn = n * n;
 
+    /*  R's width is the storage dial. fp32 -> 8n^2, b24 -> 7n^2, bf16 ->
+        6n^2, against a fixed 4n^2 for the fp32 factorization. */
+    {
+        std::string const want =
+            (tuning::current().get("rir.r_format_bf16", 0) != 0)? "bf16"
+          : (tuning::current().get("rir.r_format_b24",  0) != 0)? "b24"
+          : "fp32";
+        st.r_format = (want == "bf16")? ozaki::format::bf16
+                    : (want == "b24") ? ozaki::format::b24
+                                      : ozaki::format::fp32;
+    }
+    std::size_t const r_bytes = ozaki::bytes_of(st.r_format);
+    st.storage_n2 = 4. + static_cast<double>(r_bytes);
+
     st.d_lu   = static_cast<float *>(st.acquire(nn * sizeof(float)));
-    st.d_r    = static_cast<float *>(st.acquire(nn * sizeof(float)));
+    st.d_r    = st.acquire(nn * r_bytes);
     st.d_ipiv = static_cast<int *>(st.acquire(n * sizeof(int)));
     st.d_perm = static_cast<int *>(st.acquire(n * sizeof(int)));
 
@@ -140,6 +154,13 @@ void factor_rir(state &st, problem &prob) {
     double *d_acc = static_cast<double *>(st.acquire(n * nb * sizeof(double)));
     double *d_u   = static_cast<double *>(st.acquire(n * nb * sizeof(double)));
 
+    /*  R is formed in fp32 a block at a time and compressed on the way out, so
+        the full-width array never exists. Staging one column block costs
+        n * nb * 4 bytes; materializing all of R in fp32 first would cost 4n^2
+        and defeat the point of compressing it. */
+    float *d_r_block = static_cast<float *>(
+        st.acquire(n * nb * sizeof(float)));
+
     /*  The build's result is STORED and reused by every solve, so its error is
         undamped — unlike a refinement residual, which the next iteration
         corrects. On this operand (L*U from a real factorization) blocking above
@@ -155,7 +176,7 @@ void factor_rir(state &st, problem &prob) {
     factorize::lu_fp32(
         st.d_lu, st.d_ipiv, st.d_perm, d_work, d_info, prob.d_a, prob);
 
-    ozaki::row_max(ws.d_mu, st.d_lu, n, n, ozaki::shape::lower, prob);
+    ozaki::row_max(ws.d_mu, st.d_lu, ozaki::format::fp32, n, n, ozaki::shape::lower, prob);
 
     for (std::size_t j = 0; j < n; j += nb) {
 
@@ -179,8 +200,12 @@ void factor_rir(state &st, problem &prob) {
 
         form_r_block_kernel<<<launch::grid_for(n * n_c),
                               launch::BLOCK_SIZE>>>(
-            st.d_r, d_acc, st.d_lu, prob.d_a, st.d_perm, n, j, n_c);
+            d_r_block, d_acc, st.d_lu, prob.d_a, st.d_perm, n, j, n_c);
         KERNEL_CHECK();
+
+        ozaki::compress(
+            static_cast<unsigned char *>(st.d_r) + j * n * r_bytes,
+            d_r_block, n * n_c, st.r_format, prob);
     }
 
     st.factor_ms = watch.stop();
@@ -200,6 +225,7 @@ void solve_rir(
     double *d_rhs  = static_cast<double *>(st.acquire(nk * sizeof(double)));
     double *d_prev = static_cast<double *>(st.acquire(nk * sizeof(double)));
     double *d_t    = static_cast<double *>(st.acquire(nk * sizeof(double)));
+    double *d_neg  = static_cast<double *>(st.acquire(nk * sizeof(double)));
     float  *d_y    = static_cast<float *>(st.acquire(nk * sizeof(float)));
 
     ozaki::config const cfg = config_for("rir.solve");
@@ -211,8 +237,8 @@ void solve_rir(
     /*  R*X never cancels — R is already ~2^-24 of A — which is the structural
         reason this form needs no fp64. Negated once so the residual is an
         accumulate rather than a subtract; restored before returning. */
-    convert::negate(st.d_r, n * n, prob);
-    ozaki::row_max(ws.d_mu, st.d_r, n, n, ozaki::shape::full, prob);
+    
+    ozaki::row_max(ws.d_mu, st.d_r, st.r_format, n, n, ozaki::shape::full, prob);
 
     convert::permute_rows(d_pb, d_b, st.d_perm, n, k, prob);
     convert::zero(d_x, nk, prob);
@@ -237,8 +263,13 @@ void solve_rir(
 
         if (it != 0) {
             ozaki::column_max(ws.d_nu, d_x, n, k, prob);
+            convert::zero(d_neg, nk, prob);
+            /*  Subtracted rather than accumulated: R is packed, so negating
+                it in place is no longer a single kernel over floats. */
             ozaki::accumulate_product(
-                d_rhs, st.d_r, d_x, n, k, ozaki::shape::full, ws, prob);
+                d_neg, st.d_r, d_x, n, k, ozaki::shape::full, ws, prob,
+                0, st.r_format);
+            convert::subtract(d_rhs, d_neg, nk, prob);
         }
 
         convert::demote(d_y, d_rhs, nk, prob);
@@ -282,14 +313,14 @@ void solve_rir(
     {
         /*  t = U * X. */
         convert::zero(d_t, nk, prob);
-        ozaki::row_max(ws.d_mu, st.d_lu, n, n, ozaki::shape::upper, prob);
+        ozaki::row_max(ws.d_mu, st.d_lu, ozaki::format::fp32, n, n, ozaki::shape::upper, prob);
         ozaki::column_max(ws.d_nu, d_x, n, k, prob);
         ozaki::accumulate_product(
             d_t, st.d_lu, d_x, n, k, ozaki::shape::upper, ws, prob);
 
         /*  rhs -= L * t, with L's unit diagonal supplying the -t term. */
         convert::negate(st.d_lu, n * n, prob);
-        ozaki::row_max(ws.d_mu, st.d_lu, n, n, ozaki::shape::lower, prob);
+        ozaki::row_max(ws.d_mu, st.d_lu, ozaki::format::fp32, n, n, ozaki::shape::lower, prob);
         ozaki::column_max(ws.d_nu, d_t, n, k, prob);
         ozaki::accumulate_product(
             d_rhs, st.d_lu, d_t, n, k, ozaki::shape::lower, ws, prob);
@@ -307,7 +338,7 @@ void solve_rir(
     st.solve_ms     = watch.stop();
     st.n_iterations = used;
 
-    convert::negate(st.d_r, n * n, prob);
+    
 }
 
 } /* namespace solver */
