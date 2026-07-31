@@ -29,7 +29,34 @@ enum class matrix_kind {
     diag_dominant,   /* A = rand(-1,1) + n*I        -- easy               */
     moderate,        /* A = rand(-1,1) + sqrt(n)*I                        */
     near_random,     /* A = rand(-1,1) + I          -- the stress case    */
-    graded_rows      /* rows scaled over 6 decades                        */
+    graded_rows,     /* rows scaled over 6 decades                        */
+
+    /*  A = diag(10^(d*i/n)) + 1e-6*rand. Separates CONDITIONING from PIVOT
+        GROWTH, which the other families conflate.
+
+        Every row here is strongly diagonally dominant, so partial pivoting
+        barely moves and ||L||||U||/||A|| stays near 1 — while kappa is set
+        independently by the spread of the diagonal, 10^d. If R-IR's limit is
+        conditioning it should fail here; if the limit is growth it should not
+        care. Those two hypotheses are indistinguishable on rand + shift*I,
+        where shrinking the shift raises both at once.
+
+        shift_override carries d, the number of decades. */
+    graded_diagonal,
+
+    /*  A = H L H with H = I - 2ww^T, w = ones/sqrt(n), and L log-spaced over
+        `shift` decades. Symmetric with EXACTLY the spectrum L, so the
+        conditioning is intrinsic to the eigenvalues rather than removable by
+        scaling — which is what graded_diagonal failed to be. Symmetry keeps
+        pivot growth near 1. This is the (high Skeel, low growth) cell. */
+    spd_graded,
+
+    /*  Wilkinson growth pattern on a leading shift x shift block: unit
+        diagonal, -1 below, +1 in the block's last column. Partial pivoting
+        gives growth 2^(shift-1) while the conditioning stays benign. This is
+        the (low Skeel, high growth) cell. The block is truncated because
+        2^(n-1) overflows at any useful n. */
+    wilkinson
 };
 
 char const *name_of(matrix_kind const kind);

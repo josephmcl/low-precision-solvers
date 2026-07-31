@@ -33,11 +33,16 @@ using harness::problem;
     sigma_min: the same on (A^T A)^-1, applied through the LU rather than an
     explicit inverse — two triangular solves per step.
 
-    Power iteration converges linearly and is not accurate to many digits, but
-    the quantity of interest here spans ten orders and the answer only needs to
-    be right to a factor of about two. Reported as an order of magnitude for
-    that reason. */
-double estimate_kappa(problem &prob) {
+    Convergence is checked, not assumed. Inverse iteration converges at a rate
+    set by sigma_{n-1}/sigma_n, which on a strongly NON-NORMAL matrix — which
+    rand(-1,1) + shift*I very much is — can be close to 1 and take hundreds of
+    steps. An unconverged estimate here is not merely imprecise, it is
+    systematically LOW, because the iterate has not yet reached the smallest
+    singular direction. Quoting one understates kappa and so overstates how
+    restrictive the method looks. The `converged` flag exists so that cannot
+    happen silently. */
+double estimate_kappa(problem &prob, bool &converged,
+                      double **d_lu_out, int **d_ipiv_out) {
 
     std::size_t const n = prob.n;
     int const ni = static_cast<int>(n);
@@ -70,13 +75,17 @@ double estimate_kappa(problem &prob) {
 
     /*  sigma_max: v <- A^T (A v), normalized. */
     normalize(d_v);
-    double sigma_max = 0.;
-    for (int it = 0; it != 40; ++it) {
+    double sigma_max = 0., previous = 0.;
+    converged = false;
+    for (int it = 0; it != 2000; ++it) {
         CUBLAS_CHECK(cublasDgemv(prob.blas, CUBLAS_OP_N, ni, ni,
                                  &one, prob.d_a, ni, d_v, 1, &zero, d_w, 1));
         CUBLAS_CHECK(cublasDgemv(prob.blas, CUBLAS_OP_T, ni, ni,
                                  &one, prob.d_a, ni, d_w, 1, &zero, d_v, 1));
         sigma_max = std::sqrt(normalize(d_v));
+        if (it > 4 && std::fabs(sigma_max - previous) <= 1e-6 * sigma_max)
+            break;
+        previous = sigma_max;
     }
 
     /*  Factor once, then inverse-iterate: v <- (A^T A)^-1 v via A^-1 A^-T. */
@@ -93,7 +102,10 @@ double estimate_kappa(problem &prob) {
     normalize(d_v);
 
     double sigma_min = 0.;
-    for (int it = 0; it != 40; ++it) {
+    previous = 0.;
+    int steps = 0;
+    for (int it = 0; it != 2000; ++it) {
+        ++steps;
         CUSOLVER_CHECK(cusolverDnDgetrs(prob.solver, CUBLAS_OP_T,
                                         ni, 1, d_a, ni, d_ipiv, d_v, ni,
                                         d_info));
@@ -102,9 +114,65 @@ double estimate_kappa(problem &prob) {
                                         d_info));
         double const growth = normalize(d_v);
         sigma_min = 1. / std::sqrt(growth);
+        if (it > 4 && std::fabs(sigma_min - previous) <= 1e-6 * sigma_min) {
+            converged = true;
+            break;
+        }
+        previous = sigma_min;
+    }
+    (void) steps;
+
+    *d_lu_out = d_a;
+    *d_ipiv_out = d_ipiv;
+    return (sigma_min > 0.)? sigma_max / sigma_min : 0.;
+}
+
+/*  Skeel condition number, || |A^-1| |A| ||_inf, estimated.
+
+    This is the quantity that governs componentwise backward stability and
+    mixed-precision refinement convergence — NOT kappa_2. The difference is not
+    academic: a badly scaled matrix can have kappa_2 = 1e12 and Skeel ~ 1, and
+    is then trivial for any backward-stable solver. Reporting kappa_2 alone led
+    to exactly that mistake here, concluding a method was insensitive to
+    conditioning when the test matrix was merely badly scaled.
+
+    Estimated as || |A^-1| (|A| e) ||_inf with e all-ones, using the fp64 LU.
+    That is the standard cheap approximation; it is a lower bound in general,
+    so a SMALL value is the informative case — it says the matrix really is
+    benign componentwise. */
+double estimate_skeel(problem &prob, double const *d_lu_a, int const *d_ipiv) {
+
+    std::size_t const n = prob.n;
+    int const ni = static_cast<int>(n);
+
+    std::vector<double> ha(n * n), he(n, 1.), hw(n);
+    CUDA_CHECK(cudaMemcpy(ha.data(), prob.d_a, n * n * sizeof(double),
+                          cudaMemcpyDeviceToHost));
+
+    /*  w = |A| e, the row sums of |A|. */
+    for (std::size_t i = 0; i != n; ++i) {
+        double acc = 0.;
+        for (std::size_t j = 0; j != n; ++j)
+            acc += std::fabs(ha[i + j * n]);
+        hw[i] = acc;
     }
 
-    return (sigma_min > 0.)? sigma_max / sigma_min : 0.;
+    double *d_w = static_cast<double *>(prob.acquire(n * sizeof(double)));
+    CUDA_CHECK(cudaMemcpy(d_w, hw.data(), n * sizeof(double),
+                          cudaMemcpyHostToDevice));
+
+    int *d_info = static_cast<int *>(prob.acquire(sizeof(int)));
+    CUSOLVER_CHECK(cusolverDnDgetrs(prob.solver, CUBLAS_OP_N, ni, 1,
+                                    d_lu_a, ni, d_ipiv, d_w, ni, d_info));
+
+    CUDA_CHECK(cudaMemcpy(hw.data(), d_w, n * sizeof(double),
+                          cudaMemcpyDeviceToHost));
+
+    double m = 0.;
+    for (std::size_t i = 0; i != n; ++i)
+        m = std::max(m, std::fabs(hw[i]));
+
+    return m;
 }
 
 } /* namespace */
@@ -120,18 +188,50 @@ int main(int argc, char **argv) {
 
     /*  Shifts spanning diagonally dominant (shift = n) down toward singular.
         Logarithmic, because kappa moves by orders across this range. */
+    /*  Dense through the transition, coarse outside it.
+
+        A 4x step in shift moved kappa by four orders between two adjacent
+        points, which left the entire range kappa = 10 .. 8000 unsampled — and
+        that is precisely the range a reader cares about. A conclusion drawn
+        across that gap is an inference, not a measurement. */
+    /*  argv[3] selects the family. "graded" sweeps DECADES of diagonal
+        spread at near-unit growth; the default sweeps the diagonal shift,
+        where kappa and growth move together. */
+    char const *fam = (argc > 3)? argv[3] : "shift";
+    bool const graded = std::strcmp(fam, "graded") == 0;
+    bool const spd    = std::strcmp(fam, "spd") == 0;
+    bool const wilk   = std::strcmp(fam, "wilkinson") == 0;
+    harness::matrix_kind const kind =
+        graded? harness::matrix_kind::graded_diagonal
+      : spd?    harness::matrix_kind::spd_graded
+      : wilk?   harness::matrix_kind::wilkinson
+      :         harness::matrix_kind::near_random;
+
     std::vector<double> shifts;
-    for (double s = static_cast<double>(n); s >= 0.5; s /= 4.)
-        shifts.push_back(s);
-    shifts.push_back(0.25);
-    shifts.push_back(0.125);
+    if (graded || spd) {
+        for (double d = 0.; d <= 12.; d += 1.)
+            shifts.push_back(d);
+    }
+    else if (wilk) {
+        for (double m = 4.; m <= 40.; m += 4.)
+            shifts.push_back(m);
+    }
+    else {
+        for (double s = static_cast<double>(n); s > 128.; s /= 4.)
+            shifts.push_back(s);
+        for (double s = 128.; s >= 8.; s /= 1.25)
+            shifts.push_back(s);
+        for (double s = 4.; s >= 0.125; s /= 4.)
+            shifts.push_back(s);
+    }
 
     std::cout << "conditioning sweep   n=" << n << "  k=" << k << "\n"
               << "A = rand(-1,1) + shift*I; kappa_2 by power iteration\n\n";
 
     std::cout << "  " << std::right
-              << std::setw(9)  << "shift"
-              << std::setw(11) << "kappa_2"
+              << std::setw(9)  << (wilk? "block" : (graded||spd)? "decades" : "shift")
+              << std::setw(12) << "kappa_2"
+              << std::setw(11) << "skeel"
               << std::setw(14) << "direct fp64"
               << std::setw(14) << "split-MPIR"
               << std::setw(14) << "R-IR"
@@ -141,16 +241,22 @@ int main(int argc, char **argv) {
 
     for (std::size_t si = 0; si != shifts.size(); ++si) {
 
-        problem prob(n, k, harness::matrix_kind::near_random, 7u, shifts[si]);
+        problem prob(n, k, kind, 7u, shifts[si]);
 
-        double const kappa = estimate_kappa(prob);
+        bool converged = false;
+        double *d_lu_a = nullptr; int *d_ipiv_a = nullptr;
+        double const kappa = estimate_kappa(prob, converged,
+                                            &d_lu_a, &d_ipiv_a);
+        double const skeel = estimate_skeel(prob, d_lu_a, d_ipiv_a);
 
         double *d_x = static_cast<double *>(
             prob.acquire(n * k * sizeof(double)));
 
         std::cout << "  " << std::right << std::scientific
                   << std::setprecision(1) << std::setw(9) << shifts[si]
-                  << std::setw(11) << kappa;
+                  << std::setw(11) << kappa
+                  << (converged? " " : "?")
+                  << std::setw(11) << skeel;
 
         for (std::size_t mi = 0; mi != methods.size(); ++mi) {
             solver::state st;

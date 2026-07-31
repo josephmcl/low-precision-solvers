@@ -19,6 +19,9 @@ char const *name_of(matrix_kind const kind) {
         case matrix_kind::moderate:      return "moderate (+sqrt n)";
         case matrix_kind::near_random:   return "near-random (+1)";
         case matrix_kind::graded_rows:   return "graded rows (6 dec)";
+        case matrix_kind::graded_diagonal: return "graded diagonal";
+        case matrix_kind::spd_graded:    return "SPD log-spectrum";
+        case matrix_kind::wilkinson:     return "Wilkinson growth";
     }
     return "unknown";
 }
@@ -73,10 +76,58 @@ __global__ void generate_matrix_kernel(
             v *= pow(10., e);
         }
 
-        if (i == j)
-            v += shift;
+        /*  Graded diagonal: the off-diagonal is deliberately tiny so the
+            matrix stays diagonally dominant at every scale, keeping growth
+            near 1 while the diagonal spread sets kappa. */
+        if (kind == static_cast<int>(matrix_kind::spd_graded)) {
 
-        d_a[idx] = v;
+            /*  H L H with w = ones/sqrt(n) expands to
+                  A_ij = l_i d_ij - 2 l_j/n - 2 l_i/n + 4c/n,   c = mean(l).
+                c is the geometric-series mean, in closed form so no reduction
+                is needed. */
+            double const dec = shift;
+            double const li = pow(10., -dec * static_cast<double>(i) /
+                                        static_cast<double>(n));
+            double const lj = pow(10., -dec * static_cast<double>(j) /
+                                        static_cast<double>(n));
+            double const r  = pow(10., -dec / static_cast<double>(n));
+            double const c  = (fabs(1. - r) > 1e-300)?
+                (1. - pow(10., -dec)) / (1. - r) / static_cast<double>(n) : 1.;
+
+            double a = -2. * lj / static_cast<double>(n)
+                       -2. * li / static_cast<double>(n)
+                       + 4. * c / static_cast<double>(n);
+            if (i == j) a += li;
+            d_a[idx] = a;
+        }
+        else if (kind == static_cast<int>(matrix_kind::wilkinson)) {
+
+            std::size_t const m = static_cast<std::size_t>(shift);
+            double a;
+            if (i < m && j < m) {
+                if (i == j)            a =  1.;
+                else if (j == m - 1)   a =  1.;
+                else if (j < i)        a = -1.;
+                else                   a =  0.;
+            }
+            else {
+                a = (i == j)? 1. : v * 1.e-8;
+            }
+            d_a[idx] = a;
+        }
+        else if (kind == static_cast<int>(matrix_kind::graded_diagonal)) {
+            v *= 1.e-6;
+            if (i == j)
+                v += pow(10., shift * static_cast<double>(i) /
+                              static_cast<double>(n));
+            d_a[idx] = v;
+
+        }
+        else {
+            if (i == j)
+                v += shift;
+            d_a[idx] = v;
+        }
     }
 }
 
@@ -148,6 +199,9 @@ void problem::_generate(unsigned const seed, double const shift_override) {
             break;
         case matrix_kind::near_random:   shift = 1.; break;
         case matrix_kind::graded_rows:   shift = static_cast<double>(n); break;
+        case matrix_kind::graded_diagonal: shift = 6.; break;
+        case matrix_kind::spd_graded:    shift = 8.; break;
+        case matrix_kind::wilkinson:     shift = 24.; break;
     }
 
     if (shift_override >= 0.)
