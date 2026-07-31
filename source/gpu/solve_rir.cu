@@ -115,6 +115,37 @@ ozaki::config config_for(std::string const &prefix) {
     return cfg;
 }
 
+/*  Multiply R elementwise by (1 + eps*u), u uniform in [-1,1].
+
+    A CONTROLLED perturbation, to answer directly what an inaccurate R costs.
+    Every attempt so far to infer that from uncontrolled variation — comparing
+    R against a reference, or against another configuration — has been
+    ambiguous, because it could not say whether the difference measured was in
+    R or in the thing R was compared to. Injecting a known error removes the
+    reference entirely: if the delivered backward error responds as
+    eps * ||R||/||A||, then R's accuracy sets the floor at that level. If it
+    does not respond, R is not the limiter and no amount of build precision
+    matters. */
+__global__ void rir_perturb_r_kernel(
+    float             *d_r,
+    std::size_t const  n_total,
+    float const        eps,
+    unsigned const     seed) {
+
+    for (std::size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < n_total;
+         idx += static_cast<std::size_t>(blockDim.x) * gridDim.x) {
+
+        unsigned t = seed + static_cast<unsigned>(idx) * 2654435761u;
+        t ^= t >> 16; t *= 0x7feb352du;
+        t ^= t >> 15; t *= 0x846ca68bu;
+        t ^= t >> 16;
+
+        float const u = (static_cast<float>(t >> 8) / 16777216.f - 0.5f) * 2.f;
+        d_r[idx] *= (1.f + eps * u);
+    }
+}
+
 } /* namespace */
 
 void factor_rir(state &st, problem &prob) {
@@ -213,6 +244,16 @@ void factor_rir(state &st, problem &prob) {
     }
 
     st.factor_ms = watch.stop();
+
+    /*  Controlled perturbation of R, off unless asked. rir.perturb_r_exp is a
+        negative power of ten: -5 multiplies every entry of R by 1 +- 1e-5. */
+    int const pexp = tuning::current().get("rir.perturb_r_exp", 0);
+    if (pexp != 0) {
+        float const eps = static_cast<float>(std::pow(10., pexp));
+        rir_perturb_r_kernel<<<launch::grid_for(nn), launch::BLOCK_SIZE>>>(
+            static_cast<float *>(st.d_r), nn, eps, 12345u);
+        KERNEL_CHECK();
+    }
 }
 
 void solve_rir(
