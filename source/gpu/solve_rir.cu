@@ -388,6 +388,11 @@ void solve_rir(
         if (it == 0)
             first = current;
         else {
+            /*  current/previous is the square of the fixed point's contraction
+                ratio, so this aborts whenever rho > 0.5. Measured: loosening it
+                to abort only on true divergence, with the cap raised to 40,
+                changes the ill-conditioned result by 1% (1.95e-11 against
+                1.93e-11). The outer loop is not being cut short. */
             bool const stalled   = current > 0.25 * previous;
             bool const converged = current <= tol * first;
             if (stalled || converged)
@@ -404,8 +409,34 @@ void solve_rir(
 
         Both products are Ozaki and both are triangular, which is where this
         scheme's one arithmetic advantage lives — the dense baselines have no
-        triangle to exploit. */
-    {
+        triangle to exploit.
+
+        ONE step is enough only while kappa(LU) is small. Each step contracts
+        by kappa*u_32, so at kappa = 5.6e4 a single step buys 3.4e-3 and the
+        answer floors near 2e-11 — which is exactly where the conditioning
+        sweep found R-IR sitting, insensitive to every other knob including a
+        1e-4 perturbation of R. This is the ill-conditioned limiter. */
+    std::size_t const n_refine = static_cast<std::size_t>(
+        tuning::current().get("rir.solve.n_refine", 1));
+
+    /*  The refinement consumes d_rhs — accumulate_product adds into it and the
+        unit-diagonal trick subtracts from it — so a second pass would build on
+        a destroyed residual. Save the outer loop's rhs and restore it each
+        pass. d_prev is dead once the outer loop exits, so this costs nothing.
+
+        Note the rhs held fixed here is PB - R*X_last, from the LAST outer
+        pass. That is deliberate: these passes refine the TRIANGULAR solve
+        LU X = rhs against a fixed right-hand side, which is a different loop
+        from the outer fixed point that updates rhs as X moves. */
+    CUDA_CHECK(cudaMemcpy(
+        d_prev, d_rhs, nk * sizeof(double), cudaMemcpyDeviceToDevice));
+
+    for (std::size_t rf = 0; rf != n_refine; ++rf) {
+
+        if (rf != 0)
+            CUDA_CHECK(cudaMemcpy(
+                d_rhs, d_prev, nk * sizeof(double), cudaMemcpyDeviceToDevice));
+
         /*  t = U * X. */
         convert::zero(d_t, nk, prob);
         ozaki::row_max(ws.d_mu, st.d_lu, ozaki::format::fp32, n, n, ozaki::shape::upper, prob);
