@@ -1,4 +1,5 @@
 #include "common/solver.h"
+#include "common/trsm.h"
 
 /*  R-IR: store R = PA - LU instead of A. Storage 8n^2.
     (fp32 LU + fp32 R; 6n^2 if R is kept in bf16.)
@@ -23,11 +24,26 @@
     second Theta(n^3) pass, so at few right-hand sides this cannot win on time
     and is not meant to.
 
-    LIMIT. On ill-conditioned input this method floors near 1e-10 and no amount
-    of Ozaki exactness recovers it — the limit is R itself. A poor fp32
-    factorization makes ||R|| grow, and R's 24 stored bits then cover
-    proportionally less of A. Unlike split-MPIR's residual, which fails on such
-    input only when misconfigured, this is structural. */
+    LIMIT — RETRACTED. This comment previously read that the method floors near
+    1e-10 on ill-conditioned input, structurally, because R's 24 stored bits
+    cover proportionally less of A as ||R|| grows. That was measured with an
+    fp32 triangular solve, which was itself the limiter by a factor of 8e6.
+    With an accurate solve there is no conditioning limit: across a shift sweep
+    spanning kappa 1 to 5.6e4, R-IR tracks a direct fp64 solve to within
+    2.4x-2.9x, and the measured contraction ratio rho never exceeds 4e-3
+    against a limit of 1.
+
+    The real convergence criterion is rho = ||(LU)^-1 R|| < 1, measured for
+    free as ||dX_m||/||dX_{m-1}||. Neither kappa nor pivot growth appears in
+    it; both were proposed here on the strength of a real correlation and both
+    were artifacts of the fp32 solve. rho also sets the pass count: below 1e-3
+    three polish passes suffice, near 3e-3 it takes five.
+
+    What DOES limit the method is its representation. R-IR never holds A, so
+    its best attainable answer is the exact solution of (LU + R)x = Pb. That is
+    the 8n^2-against-12n^2 trade appearing as accuracy rather than as memory,
+    and it is why vendor IRS — which keeps A in fp64 — reaches 2.85e-17 where
+    this reaches 5.27e-15. */
 
 namespace solver {
 
@@ -278,6 +294,19 @@ void solve_rir(
     ozaki::config const cfg = config_for("rir.solve");
     ozaki::workspace ws(n, k, cfg, prob);
 
+    /*  The accurate solve and residual. Both are used only on the POLISH
+        passes: the early passes have to converge the fixed point, not deliver
+        accuracy, and an accurate residual feeding an fp32 triangular solve is
+        precision thrown away. Measured, the last two to three passes are the
+        only ones that need to be accurate. */
+    trsm::config const tcfg = trsm::config::from_tuning();
+    trsm::workspace tws;
+    tws.acquire(prob, tcfg, n, k);
+    int const pieces_r = tuning::current().get("rir.solve.rx.pieces", 4);
+    /*  Separable from the accurate SOLVE so each can be measured alone. */
+    bool const rx_compensated =
+        tuning::current().get("rir.solve.rx.compensated", 1) != 0;
+
     bool const tf32_outer =
         tuning::current().get("rir.solve.tf32_outer", 0) != 0;
 
@@ -332,17 +361,49 @@ void solve_rir(
         10., static_cast<double>(
             tuning::current().get("rir.solve.tol_exp", -12)));
 
+    /*  Cheap passes before the polish phase begins. One is enough on every
+        matrix measured; it exists as a knob because the count is a property of
+        the problem, not of the machine. */
+    std::size_t const n_cheap = static_cast<std::size_t>(
+        tuning::current().get("rir.solve.cheap_passes", 1));
+
+    /*  rho = ||dX_m|| / ||dX_{m-1}||, the fixed point's measured contraction
+        ratio. THE convergence criterion for this method: it converges iff
+        rho < 1, and rho is available for free from two iterates the solver
+        already holds — no condition estimator, no norm of an inverse.
+
+        This replaces every kappa- and growth-based rule tried earlier. Both
+        were factors in the bound rho <= kappa * ||R||/||A||, which measured
+        ~4000x loose, and each looked predictive until swept properly. rho is
+        also what says how many polish passes are needed: below 1e-3 three
+        suffice, near 3e-3 it takes five. */
+    double rho = 0.;
+
     for (std::size_t it = 0; it != cap; ++it) {
+
+        bool const polish = it >= n_cheap;
 
         CUDA_CHECK(cudaMemcpy(
             d_rhs, d_pb, nk * sizeof(double), cudaMemcpyDeviceToDevice));
 
         if (it != 0) {
-            if (!plain_rx) {
+            if (polish && rx_compensated) {
+                /*  Compensated residual: exponent-aligned splits, TF32 tensor
+                    products, fp64 folds. Costs up to 34x accuracy to skip. */
+                trsm::residual(d_rhs, static_cast<float const *>(st.d_r),
+                               d_x, k, pieces_r, tws, tcfg, prob);
+            }
+            else if (!plain_rx) {
                 ozaki::column_max(ws.d_nu, d_x, n, k, prob);
                 convert::zero(d_neg, nk, prob);
             }
-            if (plain_rx) {
+            /*  `else if`, not `if`: this is a SECOND chain, and leaving it
+                ungated made the polish passes subtract R*X twice — once
+                compensated and once through the SGEMM below. The signature was
+                a wrong answer completely insensitive to every precision knob,
+                which is what a miscounted term looks like and what a precision
+                bug never does. */
+            else if (plain_rx) {
                 float const minus_one = -1.f, zero = 0.f;
                 convert::demote(d_xf, d_x, nk, prob);
                 CUBLAS_CHECK(cublasSgemm(
@@ -367,12 +428,23 @@ void solve_rir(
             }
         }
 
-        convert::demote(d_y, d_rhs, nk, prob);
-        factorize::lu_solve(d_y, st.d_lu, k, prob, tf32_outer);
-
         CUDA_CHECK(cudaMemcpy(
             d_prev, d_x, nk * sizeof(double), cudaMemcpyDeviceToDevice));
-        convert::promote(d_x, d_y, nk, prob);
+
+        if (polish) {
+            /*  Blocked solve: fp64 diagonal blocks, exponent-aligned trailing
+                updates. The fp32 solve below was this method's limiter by a
+                factor of 8e6 — more than R's build, R's storage, the residual,
+                the stopping rule and the refinement count combined. */
+            CUDA_CHECK(cudaMemcpy(
+                d_x, d_rhs, nk * sizeof(double), cudaMemcpyDeviceToDevice));
+            trsm::solve(d_x, st.d_lu, k, tws, tcfg, prob);
+        }
+        else {
+            convert::demote(d_y, d_rhs, nk, prob);
+            factorize::lu_solve(d_y, st.d_lu, k, prob, tf32_outer);
+            convert::promote(d_x, d_y, nk, prob);
+        }
 
         ++used;
 
@@ -385,18 +457,65 @@ void solve_rir(
             pass earlier than a tighter value with the same answer. */
         double const current =
             convert::sum_squares_difference(d_x, d_prev, nk, prob);
-        if (it == 0)
+
+        /*  The stopping rule must not straddle the cheap/polish switch. When
+            the solve's precision changes, ||dX|| jumps because the ANSWER
+            moved to a better one, not because the iteration diverged — and the
+            stall test reads that jump as divergence and quits, leaving the
+            polish phase one pass long. Measured: it stopped at 2 passes with
+            3.28e-09 where 4 passes reach 5e-15.
+
+            So the phase restarts the comparison, and no break is allowed until
+            two polish passes have run and can be compared against each other. */
+        bool const just_switched = (it == n_cheap);
+        std::size_t const polish_done = polish? (it - n_cheap + 1) : 0;
+
+        if (it == 0 || just_switched) {
             first = current;
-        else {
-            /*  current/previous is the square of the fixed point's contraction
-                ratio, so this aborts whenever rho > 0.5. Measured: loosening it
-                to abort only on true divergence, with the cap raised to 40,
-                changes the ill-conditioned result by 1% (1.95e-11 against
-                1.93e-11). The outer loop is not being cut short. */
-            bool const stalled   = current > 0.25 * previous;
-            bool const converged = current <= tol * first;
-            if (stalled || converged)
-                break;
+            previous = current;
+            continue;
+        }
+
+        {
+            if (previous > 0. && current > 0.)
+                rho = std::sqrt(current / previous);
+            if (polish && polish_done < 2) {
+                previous = current;
+                continue;
+            }
+            /*  In the POLISH phase the test must be relative to the previous
+                step, not to `first`.
+
+                `first` is reset at the cheap->polish switch, and that reset
+                records the jump caused by changing the solve's PRECISION — a
+                number reflecting how far the fp32 answer sat from the accurate
+                one, not the scale of the iteration. Testing
+                `current <= tol * first` against it fires on the very next pass
+                whatever the matrix, pinning the polish phase at exactly two
+                passes and making `max_outer` inert. Benign problems converge
+                in two and looked correct; ill-conditioned ones need more and
+                silently did not get them — 1.78e-11 where four passes reach
+                1e-14, with the pass-count knobs showing no effect at all,
+                which is the signature of a parameter that is not connected
+                rather than one that does not matter.
+
+                "Still improving" is the honest criterion: keep going while the
+                step is at least halving, stop when it is not. That adapts to
+                rho without having to name it — slow convergence simply runs
+                longer, and the cap remains the only hard limit. */
+            if (polish) {
+                bool const still_improving = current < 0.5 * previous;
+                if (!still_improving)
+                    break;
+            }
+            else {
+                /*  Cheap phase: rho > 0.5 aborts, and `first` is meaningful
+                    here because nothing has changed precision yet. */
+                bool const stalled   = current > 0.25 * previous;
+                bool const converged = current <= tol * first;
+                if (stalled || converged)
+                    break;
+            }
         }
         previous = current;
     }
@@ -416,7 +535,11 @@ void solve_rir(
         answer floors near 2e-11 — which is exactly where the conditioning
         sweep found R-IR sitting, insensitive to every other knob including a
         1e-4 perturbation of R. This is the ill-conditioned limiter. */
-    std::size_t const n_refine = static_cast<std::size_t>(
+    /*  Skipped entirely when polish passes ran: those already solved the
+        triangular system to fp64 accuracy, and this block's correction is
+        computed with the fp32 `lu_solve` it was written to repair. Running it
+        afterwards can only add error. It remains for the cheap-only path. */
+    std::size_t const n_refine = (used > n_cheap)? 0u : static_cast<std::size_t>(
         tuning::current().get("rir.solve.n_refine", 1));
 
     /*  The refinement consumes d_rhs — accumulate_product adds into it and the
@@ -463,6 +586,7 @@ void solve_rir(
 
     st.solve_ms     = watch.stop();
     st.n_iterations = used;
+    st.rho = rho;
 
     
 }

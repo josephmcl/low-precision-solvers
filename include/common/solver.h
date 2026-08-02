@@ -56,6 +56,15 @@ struct state {
         timings beside it. */
     double      storage_n2   = 0.;
 
+    /*  Measured contraction ratio of the fixed point, ||dX_m||/||dX_{m-1}||.
+
+        THE convergence criterion for a fixed-point scheme: it converges iff
+        rho < 1. Free to compute from two iterates the solver already holds, so
+        a caller can check convergence at runtime and fall back — which no
+        kappa-based rule allows, since kappa needs an estimator. It also
+        predicts the pass count. Zero when the method does not iterate. */
+    double      rho          = 0.;
+
     double      factor_ms    = 0.;
     double      solve_ms     = 0.;
     double      total_ms     = 0.;

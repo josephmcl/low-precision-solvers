@@ -48,6 +48,7 @@ COMMON    := \
 	$(COM_OBJ)/problem.o     \
 	$(COM_OBJ)/metrics.o     \
 	$(COM_OBJ)/ozaki.o       \
+	$(COM_OBJ)/trsm.o        \
 	$(COM_OBJ)/solver.o      \
 	$(OBJ_DIR)/solve_direct.o \
 	$(OBJ_DIR)/solve_split_mpir.o \
