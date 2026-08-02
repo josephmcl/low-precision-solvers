@@ -347,12 +347,40 @@ void solve(
     solve_one(false, d_lu, d_x, ni, ki, ws, cfg, prob);
 }
 
+__global__ void set_identity(float *d_m, std::size_t const n) {
+    std::size_t const total = n * n;
+    for (std::size_t t = blockIdx.x * blockDim.x + threadIdx.x;
+         t < total; t += static_cast<std::size_t>(blockDim.x) * gridDim.x)
+        d_m[t] = ((t % n) == (t / n))? 1.f : 0.f;
+}
+
+void form_inverse(float *d_m, float const *d_lu, problem &prob) {
+
+    int const ni = static_cast<int>(prob.n);
+    float const one = 1.f;
+
+    set_identity<<<256, 256>>>(d_m, prob.n);
+    KERNEL_CHECK();
+
+    /*  M = U^-1 L^-1, by solving against the identity. fp32 throughout: the
+        VALUES are the fp32 factor's, and R already holds that factor's error,
+        so inverting more precisely would not remove it. Cost is ~n^3 with a
+        tiny constant — 0.79 ms at n=4096 against the R build's ~154 ms. */
+    CUBLAS_CHECK(cublasStrsm(
+        prob.blas, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N,
+        CUBLAS_DIAG_UNIT, ni, ni, &one, d_lu, ni, d_m, ni));
+    CUBLAS_CHECK(cublasStrsm(
+        prob.blas, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N,
+        CUBLAS_DIAG_NON_UNIT, ni, ni, &one, d_lu, ni, d_m, ni));
+}
+
 void residual(
     double            *d_acc,
     float const       *d_r,
     double const      *d_x,
     std::size_t const  k,
     int const          pieces_r,
+    double const       scale,
     workspace         &ws,
     config const      &cfg,
     problem           &prob) {
@@ -412,7 +440,7 @@ void residual(
                 first = false;
             }
             if (!first) {
-                fold<<<256, 256>>>(d_acc, ni, ws.d_product, ni, -1., ni, ki);
+                fold<<<256, 256>>>(d_acc, ni, ws.d_product, ni, scale, ni, ki);
                 KERNEL_CHECK();
             }
         }

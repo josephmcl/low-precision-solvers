@@ -259,6 +259,24 @@ void factor_rir(state &st, problem &prob) {
             d_r_block, n * n_c, st.r_format, prob);
     }
 
+    /*  M = (LU)^-1, replacing the packed factor.
+
+        R is built above from L and U; after that the factor is needed only to
+        APPLY (LU)^-1, and applying it as one dense product is 1.94x faster
+        than the blocked triangular solve because a solve serialises its
+        diagonal blocks. Storage is unchanged — M is n^2 fp32 exactly as the
+        packed factor was, and d_lu is dead from here on. */
+    /*  Off by default: an fp32 M puts the fixed point at (M^-1 + R) X = PB
+        with M^-1 about kappa*u_32 from LU, so the answer floors near 1e-9 and
+        degrades with conditioning (sec.87). The form is fast and correct only
+        with an fp64 inverse, which is 12n^2. */
+    if (tuning::current().get("rir.solve.m_form", 0) != 0) {
+        float *d_m = static_cast<float *>(st.acquire(nn * sizeof(float)));
+        trsm::form_inverse(d_m, st.d_lu, prob);
+        st.d_lu = d_m;
+        st.m_form = true;
+    }
+
     st.factor_ms = watch.stop();
 
     /*  Controlled perturbation of R, off unless asked. rir.perturb_r_exp is a
@@ -364,8 +382,27 @@ void solve_rir(
     /*  Cheap passes before the polish phase begins. One is enough on every
         matrix measured; it exists as a knob because the count is a property of
         the problem, not of the machine. */
-    std::size_t const n_cheap = static_cast<std::size_t>(
-        tuning::current().get("rir.solve.cheap_passes", 1));
+    /*  POLISH IS OPT-IN, and off by default.
+
+        The original design — cheap fp32 passes, then ONE mp-TRSM refinement at
+        the end — measures 257.9 ms / 8.96e-16 at n=8192 k=2048, against
+        split-MPIR's 437.0 and direct fp64's 441.8 at 8n^2. Replacing that
+        single refinement with an accurate solve on every polish pass costs
+        2.3x the time for 2.2x the accuracy (851.5 ms / 4.12e-16), and the M
+        and G forms were then built to claw back a cost that need not have been
+        paid.
+
+        The structure was already right: iterate cheaply, correct once,
+        accurately, at the end. That is the same conclusion sec.49 reached
+        independently as "cheap-then-polish" and sec.60 confirmed structurally —
+        it was in this file from the start, in the n_refine block below. */
+    bool const use_polish =
+        tuning::current().get("rir.solve.polish", 0) != 0;
+
+    std::size_t const n_cheap = use_polish
+        ? static_cast<std::size_t>(
+              tuning::current().get("rir.solve.cheap_passes", 1))
+        : cap;
 
     /*  rho = ||dX_m|| / ||dX_{m-1}||, the fixed point's measured contraction
         ratio. THE convergence criterion for this method: it converges iff
@@ -391,7 +428,7 @@ void solve_rir(
                 /*  Compensated residual: exponent-aligned splits, TF32 tensor
                     products, fp64 folds. Costs up to 34x accuracy to skip. */
                 trsm::residual(d_rhs, static_cast<float const *>(st.d_r),
-                               d_x, k, pieces_r, tws, tcfg, prob);
+                               d_x, k, pieces_r, -1., tws, tcfg, prob);
             }
             else if (!plain_rx) {
                 ozaki::column_max(ws.d_nu, d_x, n, k, prob);
@@ -432,13 +469,30 @@ void solve_rir(
             d_prev, d_x, nk * sizeof(double), cudaMemcpyDeviceToDevice));
 
         if (polish) {
-            /*  Blocked solve: fp64 diagonal blocks, exponent-aligned trailing
-                updates. The fp32 solve below was this method's limiter by a
-                factor of 8e6 — more than R's build, R's storage, the residual,
-                the stopping rule and the refinement count combined. */
-            CUDA_CHECK(cudaMemcpy(
-                d_x, d_rhs, nk * sizeof(double), cudaMemcpyDeviceToDevice));
-            trsm::solve(d_x, st.d_lu, k, tws, tcfg, prob);
+            if (st.m_form) {
+                /*  X = M rhs, one dense compensated product. */
+                convert::zero(d_x, nk, prob);
+                trsm::residual(d_x, st.d_lu, d_rhs, k, tcfg.pieces_tri, 1.,
+                               tws, tcfg, prob);
+            }
+            else {
+                CUDA_CHECK(cudaMemcpy(
+                    d_x, d_rhs, nk * sizeof(double), cudaMemcpyDeviceToDevice));
+                trsm::solve(d_x, st.d_lu, k, tws, tcfg, prob);
+            }
+        }
+        else if (st.m_form) {
+            /*  Cheap pass: the same product in plain fp32. The early passes
+                only walk the fixed point in, so precision spent here is
+                destroyed by the next accurate pass anyway. */
+            float const one = 1.f, zero = 0.f;
+            convert::demote(d_y, d_rhs, nk, prob);
+            CUBLAS_CHECK(cublasSgemm(
+                prob.blas, CUBLAS_OP_N, CUBLAS_OP_N,
+                static_cast<int>(n), static_cast<int>(k), static_cast<int>(n),
+                &one, st.d_lu, static_cast<int>(n),
+                d_y, static_cast<int>(n), &zero, d_xf, static_cast<int>(n)));
+            convert::promote(d_x, d_xf, nk, prob);
         }
         else {
             convert::demote(d_y, d_rhs, nk, prob);
@@ -504,17 +558,49 @@ void solve_rir(
                 rho without having to name it — slow convergence simply runs
                 longer, and the cap remains the only hard limit. */
             if (polish) {
-                bool const still_improving = current < 0.5 * previous;
-                if (!still_improving)
+                /*  Stop when the ANSWER stops moving, not when the STEP stops
+                    halving. Those differ: the step can keep contracting long
+                    after the iterate has reached the accuracy its
+                    representation allows, and "still halving" then runs three
+                    extra passes for nothing — measured, 6 passes and 3 give
+                    4.12e-16 alike, at 1266 ms against 510.
+
+                    The scale-free test is ||dX|| against ||X||: once the step
+                    is at fp64 rounding relative to the solution, further
+                    passes cannot change it. `first` is deliberately not used —
+                    it records the cheap->polish precision jump, not the scale
+                    of the iteration. */
+                double x_norm = 0.;
+                CUBLAS_CHECK(cublasDnrm2(
+                    prob.blas, static_cast<int>(nk), d_x, 1, &x_norm));
+                bool const at_solution_scale =
+                    current <= 1e-32 * x_norm * x_norm;
+                bool const not_improving = current >= previous;
+                if (at_solution_scale || not_improving)
                     break;
             }
             else {
-                /*  Cheap phase: rho > 0.5 aborts, and `first` is meaningful
-                    here because nothing has changed precision yet. */
-                bool const stalled   = current > 0.25 * previous;
-                bool const converged = current <= tol * first;
-                if (stalled || converged)
-                    break;
+                /*  With a polish phase to reach, the cheap phase must run its
+                    budget: it converges to the fp32 solve's own floor (~1e-7)
+                    long before the answer is acceptable, and exiting there
+                    skips the polish entirely — measured once as 2 passes and
+                    9.32e-09.
+
+                    WITHOUT a polish phase the opposite holds. The refinement
+                    below supplies the accuracy, so the cheap loop should stop
+                    as soon as the iterate settles; forcing it to the cap
+                    inflated the original configuration from 257.9 ms to
+                    368.7 ms for nothing. */
+                if (use_polish) {
+                    if (current > previous)
+                        break;
+                }
+                else {
+                    bool const stalled   = current > 0.25 * previous;
+                    bool const converged = current <= tol * first;
+                    if (stalled || converged)
+                        break;
+                }
             }
         }
         previous = current;
@@ -539,7 +625,7 @@ void solve_rir(
         triangular system to fp64 accuracy, and this block's correction is
         computed with the fp32 `lu_solve` it was written to repair. Running it
         afterwards can only add error. It remains for the cheap-only path. */
-    std::size_t const n_refine = (used > n_cheap)? 0u : static_cast<std::size_t>(
+    std::size_t const n_refine = (use_polish || st.m_form)? 0u : static_cast<std::size_t>(
         tuning::current().get("rir.solve.n_refine", 1));
 
     /*  The refinement consumes d_rhs — accumulate_product adds into it and the

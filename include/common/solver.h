@@ -65,6 +65,9 @@ struct state {
         predicts the pass count. Zero when the method does not iterate. */
     double      rho          = 0.;
 
+    /*  d_lu holds M = (LU)^-1 rather than the packed factor. */
+    bool        m_form       = false;
+
     double      factor_ms    = 0.;
     double      solve_ms     = 0.;
     double      total_ms     = 0.;

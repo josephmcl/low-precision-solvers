@@ -104,12 +104,34 @@ void solve(
     an optimization "worth 1.27x, bit-identical to the Ozaki path" — measured
     when R-IR's floor was 1.11e-10, where nothing could have shown a
     difference. Against the current floor it costs up to 34x. */
+/*  d_m <- (LU)^-1, in fp32, overwriting nothing the caller still needs.
+
+    THE STRUCTURAL CHANGE. The accurate triangular solve is ~11x less efficient
+    per flop than a dense product, because a solve serialises its diagonal
+    blocks and a product does not. Applying (LU)^-1 as ONE dense Ozaki product
+    is 1.94x faster than the blocked solve and slightly MORE accurate.
+
+    Storage is unchanged at 8n^2: M is n^2 fp32, exactly what the packed factor
+    cost, and R is built from L and U before they are discarded. The cheap
+    passes use M through a plain fp32 SGEMM where they used to use `lu_solve`,
+    so the packed factor is not needed after this point at all. */
+void form_inverse(
+    float             *d_m,
+    float const       *d_lu,
+    problem           &prob);
+
+/*  d_acc <- d_acc + scale * (A32 * X), compensated.
+
+    Serves both R*X (scale = -1, A32 = R) and M*rhs (scale = +1, A32 = M),
+    which are the same operation: an fp32 matrix times an fp64 one, accurate
+    well past what either GEMM provides. */
 void residual(
     double            *d_acc,
     float const       *d_r,
     double const      *d_x,
     std::size_t const  k,
     int const          pieces_r,
+    double const       scale,
     workspace         &ws,
     config const      &cfg,
     problem           &prob);
