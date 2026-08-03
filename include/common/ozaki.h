@@ -91,6 +91,30 @@ enum class format {
 
 std::size_t bytes_of(format const f);
 
+/*  Unpack a ROW BLOCK of a packed matrix to fp32, so a packed R can feed
+    cuBLAS directly.
+
+    R stored as b24 or bf16 buys 7n^2 / 6n^2, but cuBLAS takes no packed type,
+    so the fast single-GEMM R*X path was gated on r_format == fp32 and packed R
+    fell back to the Ozaki cascade -- measured 10 ms slower in the solve, which
+    swamped the storage saving and made the packed formats look strictly worse
+    than they are.
+
+    Unpacking the WHOLE matrix would defeat the point: a full-width fp32 copy
+    costs 4n^2, exactly the storage the packing bought back. A row block costs
+    n_rows * n * 4 bytes and is reused for one GEMM, so the peak stays at
+    r_bytes*n^2 + O(n) and the storage claim survives.
+
+    d_out is n_rows x n, column-major with lda = n_rows.                     */
+void unpack_rows(
+    float             *d_out,
+    void const        *d_in,
+    format const       f,
+    std::size_t const  n,
+    std::size_t const  row_0,
+    std::size_t const  n_rows,
+    harness::problem  &prob);
+
 /*  Round an fp32 array into `f`, in place-compatible layout (the destination
     may alias nothing; sizes differ). Used once, when R is formed. */
 void compress(

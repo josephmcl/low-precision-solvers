@@ -357,9 +357,25 @@ void solve_rir(
         cuBLAS, and a full-width fp32 copy costs 4n^2, which is exactly the
         storage the packing was buying back. A blocked unpack would work and is
         not implemented. */
+    /*  A packed R can now take the fast path too, via a blocked unpack: the
+        gate used to be r_format == fp32 because cuBLAS has no packed type, and
+        packed R therefore fell back to the Ozaki cascade — 10 ms slower in the
+        solve, which swamped the 7n^2/6n^2 storage saving and made the packed
+        formats look strictly worse than they are. The unpack is one row block
+        at a time, so peak storage stays r_bytes*n^2 + O(n). */
     bool const plain_rx =
-        st.r_format == ozaki::format::fp32 &&
         tuning::current().get("rir.solve.plain_rx", 1) != 0;
+
+    bool const unpack_rx = plain_rx && st.r_format != ozaki::format::fp32;
+
+    /*  Row block for the unpack. Sized so the scratch is a few tens of MB and
+        each GEMM is still tall enough to fill the device. */
+    std::size_t const rx_rows = static_cast<std::size_t>(
+        tuning::current().get("rir.solve.rx_unpack_rows", 2048));
+
+    float *d_runpack = unpack_rx
+        ? static_cast<float *>(st.acquire(rx_rows * n * sizeof(float)))
+        : nullptr;
 
     /*  R*X never cancels — R is already ~2^-24 of A — which is the structural
         reason this form needs no fp64. Negated once so the residual is an
@@ -474,16 +490,83 @@ void solve_rir(
             else {
                 float const minus_one = -1.f, zero = 0.f;
                 convert::demote(d_xf, d_x, nk, prob);
-                CUBLAS_CHECK(cublasSgemm(
-                    prob.blas,
-                    CUBLAS_OP_N, CUBLAS_OP_N,
-                    static_cast<int>(n), static_cast<int>(k),
-                    static_cast<int>(n),
-                    &minus_one,
-                    static_cast<float const *>(st.d_r), static_cast<int>(n),
-                    d_xf, static_cast<int>(n),
-                    &zero,
-                    d_rx, static_cast<int>(n)));
+
+                /*  R*X. This is the single largest kernel in the solve — 57%
+                    of solve time on B300 — and cublasSgemm runs it on the SIMT
+                    path, at the fp32 rate, while the tensor cores idle. That
+                    costs little where fp32 and tf32 are close (1.3x on a 5090)
+                    and a great deal where they are not (16x on B300).
+
+                    CUBLAS_COMPUTE_32F_EMULATED_16BFX9 splits each fp32 operand
+                    into 3 bf16 values and runs 9 tensor-core products —
+                    cuBLAS's own Ozaki. 3 x 8 significand bits = 24, so it is
+                    fp32-equivalent in accuracy, and it measures 3.59x the
+                    native fp32 rate on B300 (245 against 68 TFLOP/s).
+
+                    Off by default and device-gated: it is worth nothing where
+                    fp32 already runs near the tensor rate, and emulation is
+                    not supported on every part, so this must not become a
+                    silent dependency. */
+                bool const emulate =
+                    tuning::current().get("rir.solve.rx_emulated", 0) != 0;
+
+                cublasComputeType_t const rx_ct = emulate
+                    ? CUBLAS_COMPUTE_32F_EMULATED_16BFX9
+                    : CUBLAS_COMPUTE_32F;
+
+                if (unpack_rx) {
+                    /*  Packed R: unpack one row block, multiply, repeat. Each
+                        block's output rows are independent, so this is the same
+                        arithmetic as the single GEMM with a bounded scratch. */
+                    for (std::size_t r0 = 0; r0 < n; r0 += rx_rows) {
+
+                        std::size_t const rows =
+                            (rx_rows < n - r0)? rx_rows : n - r0;
+
+                        ozaki::unpack_rows(d_runpack, st.d_r, st.r_format,
+                                           n, r0, rows, prob);
+
+                        CUBLAS_CHECK(cublasGemmEx(
+                            prob.blas,
+                            CUBLAS_OP_N, CUBLAS_OP_N,
+                            static_cast<int>(rows), static_cast<int>(k),
+                            static_cast<int>(n),
+                            &minus_one,
+                            d_runpack, CUDA_R_32F, static_cast<int>(rows),
+                            d_xf, CUDA_R_32F, static_cast<int>(n),
+                            &zero,
+                            d_rx + r0, CUDA_R_32F, static_cast<int>(n),
+                            rx_ct, CUBLAS_GEMM_DEFAULT));
+                    }
+                }
+                else if (emulate) {
+                    CUBLAS_CHECK(cublasGemmEx(
+                        prob.blas,
+                        CUBLAS_OP_N, CUBLAS_OP_N,
+                        static_cast<int>(n), static_cast<int>(k),
+                        static_cast<int>(n),
+                        &minus_one,
+                        static_cast<float const *>(st.d_r), CUDA_R_32F,
+                        static_cast<int>(n),
+                        d_xf, CUDA_R_32F, static_cast<int>(n),
+                        &zero,
+                        d_rx, CUDA_R_32F, static_cast<int>(n),
+                        CUBLAS_COMPUTE_32F_EMULATED_16BFX9,
+                        CUBLAS_GEMM_DEFAULT));
+                }
+                else {
+                    CUBLAS_CHECK(cublasSgemm(
+                        prob.blas,
+                        CUBLAS_OP_N, CUBLAS_OP_N,
+                        static_cast<int>(n), static_cast<int>(k),
+                        static_cast<int>(n),
+                        &minus_one,
+                        static_cast<float const *>(st.d_r),
+                        static_cast<int>(n),
+                        d_xf, static_cast<int>(n),
+                        &zero,
+                        d_rx, static_cast<int>(n)));
+                }
                 convert::add_correction(d_rhs, d_rx, nk, prob);
             }
         }
@@ -518,8 +601,35 @@ void solve_rir(
             convert::promote(d_x, d_xf, nk, prob);
         }
         else {
+            /*  PASS 0 IS A THROWAWAY and can be run coarser than the rest.
+
+                At it=0 the `if (it != 0)` guard above skips R*X, so this pass
+                solves LU X = PB and produces an iterate that pass 1 replaces
+                wholesale — its only job is to make R*X_1 meaningful, and with
+                rho ~ 1e-7 it barely has to be right.
+
+                tf32_outer applied to EVERY pass costs 4.6x backward error
+                (5.07e-16 -> 2.34e-15) for 8.4 ms, which is a bad trade. Applied
+                to pass 0 alone it should cost far less, because pass 1 runs in
+                fp32 and the refinement corrects against the fp64 right-hand
+                side either way. Measured, not assumed — see the config. */
+            bool const coarse_first =
+                tf32_outer ||
+                (it == 0 &&
+                 tuning::current().get("rir.solve.tf32_first", 0) != 0);
+
             convert::demote(d_y, d_rhs, nk, prob);
-            factorize::lu_solve(d_y, st.d_lu, k, prob, tf32_outer);
+            {
+                int const bnb =
+                    tuning::current().get("rir.solve.trsm_blocked", 0);
+                if (bnb > 0)
+                    factorize::lu_solve_blocked(
+                        d_y, st.d_lu, k, prob, bnb,
+                        tuning::current().get(
+                            "rir.solve.trsm_emulated", 1) != 0);
+                else
+                    factorize::lu_solve(d_y, st.d_lu, k, prob, coarse_first);
+            }
             convert::promote(d_x, d_y, nk, prob);
         }
 
@@ -665,7 +775,38 @@ void solve_rir(
 
     for (std::size_t rf = 0; rf != n_refine; ++rf) {
 
-        if (rf != 0)
+        /*  The stored rhs is PB - R*X_{m-1}, built in the LAST cheap pass —
+            but X has since advanced to X_m, so the refinement corrects against
+            a residual that is one iterate stale. It works because R*X barely
+            moves once the fixed point is near, which is also why nobody
+            noticed.
+
+            Recomputing R*X at the CURRENT iterate makes the refinement a true
+            residual correction for the whole system, PB - (LU + R)X, rather
+            than for LU alone with a lagged right-hand side. If that holds, the
+            second cheap pass is redundant: pass 0 supplies a starting iterate
+            and this supplies the correction, saving a full lu_solve. */
+        bool const recompute_rx =
+            tuning::current().get("rir.solve.refine_recompute_rx", 0) != 0;
+
+        if (recompute_rx) {
+            float const minus_one = -1.f, zero_f = 0.f;
+            CUDA_CHECK(cudaMemcpy(
+                d_rhs, d_pb, nk * sizeof(double), cudaMemcpyDeviceToDevice));
+            convert::demote(d_xf, d_x, nk, prob);
+            CUBLAS_CHECK(cublasGemmEx(
+                prob.blas, CUBLAS_OP_N, CUBLAS_OP_N,
+                static_cast<int>(n), static_cast<int>(k), static_cast<int>(n),
+                &minus_one,
+                static_cast<float const *>(st.d_r), CUDA_R_32F,
+                static_cast<int>(n),
+                d_xf, CUDA_R_32F, static_cast<int>(n),
+                &zero_f,
+                d_rx, CUDA_R_32F, static_cast<int>(n),
+                CUBLAS_COMPUTE_32F_EMULATED_16BFX9, CUBLAS_GEMM_DEFAULT));
+            convert::add_correction(d_rhs, d_rx, nk, prob);
+        }
+        else if (rf != 0)
             CUDA_CHECK(cudaMemcpy(
                 d_rhs, d_prev, nk * sizeof(double), cudaMemcpyDeviceToDevice));
 
@@ -689,7 +830,20 @@ void solve_rir(
         /*  fp32, never tf32: this solve produces the correction that sets the
             delivered accuracy. */
         convert::demote(d_y, d_rhs, nk, prob);
-        factorize::lu_solve(d_y, st.d_lu, k, prob, false);
+        {
+            /*  The refinement's solve is the THIRD lu_solve and sets the
+                delivered accuracy, so it must not lose bits — which is why it
+                passes tf32=false. The blocked path is safe here precisely
+                because bf16x9 carries 24 significand bits: it is
+                fp32-equivalent, not a precision trade. */
+            int const bnb = tuning::current().get("rir.solve.trsm_blocked", 0);
+            if (bnb > 0)
+                factorize::lu_solve_blocked(
+                    d_y, st.d_lu, k, prob, bnb,
+                    tuning::current().get("rir.solve.trsm_emulated", 1) != 0);
+            else
+                factorize::lu_solve(d_y, st.d_lu, k, prob, false);
+        }
         convert::add_correction(d_x, d_y, nk, prob);
     }
 

@@ -1,8 +1,26 @@
 #include "common/ozaki.h"
 
 #include <cuda_bf16.h>
+#include <cstdlib>
+#include <cstring>
 
 namespace ozaki {
+
+/*  Compute type for the split products. LPS_OZAKI_COMPUTE selects:
+      tf32 (default) -- 11-bit operands, fp32 accumulate  [shipped]
+      fp32           -- 24-bit operands, fp32 accumulate  [diagnostic]
+      emu            -- bf16x9 emulation, fp32 accumulate [diagnostic]
+    The accumulator is fp32 in all three, so a difference between them isolates
+    the operand-width ceiling from the accumulator one. */
+static cublasComputeType_t ozaki_compute_type() {
+    char const *v = std::getenv("LPS_OZAKI_COMPUTE");
+    if (v != nullptr) {
+        if (std::strcmp(v, "fp32") == 0) return CUBLAS_COMPUTE_32F;
+        if (std::strcmp(v, "emu")  == 0) return CUBLAS_COMPUTE_32F_EMULATED_16BFX9;
+    }
+    return CUBLAS_COMPUTE_32F_FAST_TF32;
+}
+
 
 using harness::problem;
 
@@ -134,6 +152,55 @@ __global__ void compress_kernel(
             b[2] = static_cast<unsigned char>((bits >> 24) & 0xFFu);
         }
     }
+}
+
+template <format F>
+__global__ void unpack_rows_kernel(
+    float             *d_out,
+    void const        *d_in,
+    std::size_t const  n,
+    std::size_t const  row_0,
+    std::size_t const  n_rows) {
+
+    std::size_t const total = n_rows * n;
+
+    /*  i is the fast index of both source and destination (column-major on
+        each side), so consecutive threads touch consecutive addresses. */
+    for (std::size_t t = blockIdx.x * blockDim.x + threadIdx.x;
+         t < total;
+         t += static_cast<std::size_t>(blockDim.x) * gridDim.x) {
+
+        std::size_t const i = t % n_rows;
+        std::size_t const j = t / n_rows;
+        d_out[i + j * n_rows] =
+            read_packed<F>(d_in, (row_0 + i) + j * n);
+    }
+}
+
+void unpack_rows(
+    float             *d_out,
+    void const        *d_in,
+    format const       f,
+    std::size_t const  n,
+    std::size_t const  row_0,
+    std::size_t const  n_rows,
+    problem           &prob) {
+
+    (void) prob;
+    int const g = launch::grid_for(n_rows * n);
+
+    switch (f) {
+        case format::fp32:
+            unpack_rows_kernel<format::fp32><<<g, launch::BLOCK_SIZE>>>(
+                d_out, d_in, n, row_0, n_rows); break;
+        case format::b24:
+            unpack_rows_kernel<format::b24><<<g, launch::BLOCK_SIZE>>>(
+                d_out, d_in, n, row_0, n_rows); break;
+        case format::bf16:
+            unpack_rows_kernel<format::bf16><<<g, launch::BLOCK_SIZE>>>(
+                d_out, d_in, n, row_0, n_rows); break;
+    }
+    KERNEL_CHECK();
 }
 
 void compress(
@@ -603,7 +670,22 @@ void accumulate_product(
                     CUDA_R_32F, static_cast<int>(n_c),
                     &beta,
                     ws.d_partial, CUDA_R_32F, static_cast<int>(n_rows),
-                    CUBLAS_COMPUTE_32F_FAST_TF32,
+                    /*  WHICH CEILING BINDS THE PIECE COUNT?
+
+                        Ozaki needs L*U to ~48-54 bits and gets 2*bits per
+                        piece-pair. `bits` is capped twice: by the OPERAND
+                        width (tf32 carries 11 significand bits) and by the
+                        ACCUMULATOR width (2*bits + log2(K) <= 24, fp32's
+                        mantissa). Which binds decides whether this device's
+                        faster low-precision units can help at all -- fp16 has
+                        the same 11 bits and the same fp32 accumulator, so it
+                        could only make products faster, never fewer.
+
+                        Swappable so the two can be told apart: plain 32F
+                        gives 24-bit operands with the SAME accumulator. If
+                        accuracy does not move, the accumulator binds and no
+                        wider operand format reduces the piece count. */
+                    ozaki_compute_type(),
                     CUBLAS_GEMM_DEFAULT));
 
                 first = false;

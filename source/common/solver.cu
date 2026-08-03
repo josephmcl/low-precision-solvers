@@ -1,5 +1,8 @@
 #include "common/solver.h"
 
+#include <cstdlib>
+#include <cstring>
+
 namespace solver {
 
 void *state::acquire(std::size_t const bytes) {
@@ -63,7 +66,15 @@ void run(
     {nullptr, nullptr, factor_solve}. */
 std::vector<method> const &registry() {
 
-    static std::vector<method> const methods = {
+    /*  LPS_ONLY=<substring> restricts the registry to matching methods.
+        Exists for PROFILING: all four methods issue cuBLAS GEMMs, so an
+        nsys/ncu trace of a full run cannot attribute a GEMM to a method, and
+        the Ozaki kernels of R-IR and split-MPIR share names. Filtering at the
+        registry means the trace contains one method's work and nothing else.
+
+        Unset, this is a no-op and the registry is exactly as before, so it
+        cannot perturb a measurement run that does not ask for it. */
+    static std::vector<method> const all = {
         {"direct fp64",
          factor_direct,
          solve_direct,
@@ -89,7 +100,18 @@ std::vector<method> const &registry() {
          storage::VENDOR_IRS}
     };
 
-    return methods;
+    static std::vector<method> filtered;
+    static bool built = false;
+    if (!built) {
+        built = true;
+        char const *only = std::getenv("LPS_ONLY");
+        if (only == nullptr || *only == '\0') filtered = all;
+        else
+            for (method const &m : all)
+                if (std::strstr(m.name, only) != nullptr)
+                    filtered.push_back(m);
+    }
+    return filtered;
 }
 
 } /* namespace solver */

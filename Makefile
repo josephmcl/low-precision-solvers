@@ -36,6 +36,8 @@ COM_OBJ   := build/common
 TEST_DIR  := test
 OBJ_DIR   := build/gpu
 TOBJ_DIR  := build/test
+PROF_DIR  := profile
+POBJ_DIR  := build/profile
 BIN_DIR   := bin
 
 COMMON    := \
@@ -61,12 +63,18 @@ OZTEST_MAIN := $(TOBJ_DIR)/main_ozaki_test.o
 ABLATE_MAIN := $(TOBJ_DIR)/main_ablate.o
 KAPPA_MAIN  := $(TOBJ_DIR)/main_kappa.o
 RCHECK_MAIN := $(TOBJ_DIR)/main_rcheck.o
+PROF_MAIN   := $(POBJ_DIR)/main_profile.o
+OOM_MAIN    := $(POBJ_DIR)/main_oom.o
+ENERGY_MAIN := $(POBJ_DIR)/main_energy.o
+KCHECK_MAIN := $(POBJ_DIR)/main_kappacheck.o
 
 .PHONY: all clean
 
 all: $(BIN_DIR)/lps-sweep $(BIN_DIR)/lps-probe $(BIN_DIR)/lps-ozaki-test \
      $(BIN_DIR)/lps-ablate $(BIN_DIR)/lps-kappa \
-     $(BIN_DIR)/lps-rcheck
+     $(BIN_DIR)/lps-rcheck $(BIN_DIR)/lps-profile \
+     $(BIN_DIR)/lps-oom $(BIN_DIR)/lps-energy \
+     $(BIN_DIR)/lps-kappacheck
 
 $(BIN_DIR)/lps-sweep: $(COMMON) $(SWEEP_MAIN) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
@@ -98,7 +106,7 @@ $(TOBJ_DIR)/%.o: $(TEST_DIR)/%.cu | $(TOBJ_DIR)
 $(TOBJ_DIR)/%.o: $(TEST_DIR)/%.cpp | $(TOBJ_DIR)
 	$(NVCC) $(NVCCFLAGS) -dc -x cu $< -o $@
 
-$(OBJ_DIR) $(COM_OBJ) $(TOBJ_DIR) $(BIN_DIR):
+$(OBJ_DIR) $(COM_OBJ) $(TOBJ_DIR) $(POBJ_DIR) $(BIN_DIR):
 	mkdir -p $@
 
 clean:
@@ -109,4 +117,22 @@ clean:
 # to add it here — which happened, and presented as a link error against a
 # constructor signature that had changed three files away. Any .d that exists
 # gets included, so a new target is covered the moment it first compiles.
--include $(wildcard $(COM_OBJ)/*.d $(OBJ_DIR)/*.d $(TOBJ_DIR)/*.d)
+$(POBJ_DIR)/%.o: $(PROF_DIR)/%.cpp | $(POBJ_DIR)
+	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+
+$(POBJ_DIR)/%.o: $(PROF_DIR)/%.cu | $(POBJ_DIR)
+	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+
+$(BIN_DIR)/lps-oom: $(OOM_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN_DIR)/lps-energy: $(COMMON) $(ENERGY_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS) -lnvidia-ml
+
+$(BIN_DIR)/lps-profile: $(COMMON) $(PROF_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN_DIR)/lps-kappacheck: $(COMMON) $(KCHECK_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
+
+-include $(wildcard $(COM_OBJ)/*.d $(OBJ_DIR)/*.d $(TOBJ_DIR)/*.d $(POBJ_DIR)/*.d)

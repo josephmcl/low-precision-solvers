@@ -138,6 +138,13 @@ int main(int argc, char **argv) {
 
     std::cout.setf(std::ios::unitbuf);
 
+    /*  CSV mode for the results pipeline. One row per ablation, so a figure
+        can plot cost-of-having against the optimization name without parsing
+        the human-readable table. */
+    bool csv = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--csv") == 0) csv = true;
+
     std::size_t const n = (argc > 1)?
         static_cast<std::size_t>(std::atoll(argv[1])) : 8192;
     std::size_t const k = (argc > 2)?
@@ -145,6 +152,10 @@ int main(int argc, char **argv) {
     std::size_t const repeats = (argc > 3)?
         static_cast<std::size_t>(std::atoll(argv[3])) : 2;
 
+    if (csv)
+        std::cout << "n,k,repeats,ablation,key,factor_ms,solve_ms,total_ms,"
+                     "cost,iters,backward\n";
+    else
     std::cout << "R-IR ablation   n=" << n << "  k=" << k
               << "  repeats=" << repeats << "\n"
               << "each row disables ONE optimization; the last disables all\n\n";
@@ -152,6 +163,7 @@ int main(int argc, char **argv) {
     clear_all();
     result const base = run_rir(n, k, repeats);
 
+    if (!csv)
     std::cout << "  " << std::left << std::setw(22) << "configuration"
               << std::right
               << std::setw(9)  << "factor"
@@ -161,6 +173,12 @@ int main(int argc, char **argv) {
               << std::setw(5)  << "it"
               << std::setw(12) << "backward" << "\n";
 
+    if (csv)
+        std::cout << n << ',' << k << ',' << repeats << ",baseline,--,"
+                  << base.factor << ',' << base.solve << ',' << base.total
+                  << ",1.00," << base.iterations << ',' << base.backward
+                  << '\n';
+    else
     std::cout << "  " << std::left << std::setw(22) << "all on (baseline)"
               << std::right << std::fixed << std::setprecision(1)
               << std::setw(9) << base.factor
@@ -181,6 +199,14 @@ int main(int argc, char **argv) {
             1.00 means the optimization is not paying at this size. */
         double const cost = (base.total > 0.)? r.total / base.total : 0.;
 
+        if (csv) {
+            std::cout << n << ',' << k << ',' << repeats << ",without "
+                      << ABLATIONS[i].name << ',' << ABLATIONS[i].key << ','
+                      << r.factor << ',' << r.solve << ',' << r.total << ','
+                      << cost << ',' << r.iterations << ',' << r.backward
+                      << '\n';
+            continue;
+        }
         std::cout << "  " << std::left << std::setw(22)
                   << (std::string("without ") + ABLATIONS[i].name)
                   << std::right << std::fixed << std::setprecision(1)
@@ -199,6 +225,13 @@ int main(int argc, char **argv) {
     result const none = run_rir(n, k, repeats);
     double const cost = (base.total > 0.)? none.total / base.total : 0.;
 
+    if (csv) {
+        std::cout << n << ',' << k << ',' << repeats << ",all off,--,"
+                  << none.factor << ',' << none.solve << ',' << none.total
+                  << ',' << cost << ',' << none.iterations << ','
+                  << none.backward << '\n';
+        return 0;
+    }
     std::cout << "  " << std::left << std::setw(22) << "all off"
               << std::right << std::fixed << std::setprecision(1)
               << std::setw(9) << none.factor

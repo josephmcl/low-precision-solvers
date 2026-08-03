@@ -155,8 +155,22 @@ int main(int argc, char **argv) {
         CUDA_CHECK(cudaMalloc(&d_a, n * n * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&d_b, n * n * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&d_c, n * n * sizeof(double)));
-        CUDA_CHECK(cudaMemset(d_a, 0, n * n * sizeof(double)));
-        CUDA_CHECK(cudaMemset(d_b, 0, n * n * sizeof(double)));
+        /*  REAL DATA, NOT ZEROS. These buffers were once cudaMemset to 0, and
+            that silently corrupted every data-dependent rate: the fp64
+            fixed-point emulation short-circuits on all-zero input and read
+            3.17x native, where on real operands it is 1.79-2.23x. A rate
+            measured on zeros is not a rate. */
+        {
+            std::vector<double> host(n * n);
+            for (std::size_t i = 0; i != n * n; ++i)
+                host[i] = 2. * (double(i % 1009) / 1009.) - 1.;
+            CUDA_CHECK(cudaMemcpy(d_a, host.data(), n * n * sizeof(double),
+                                  cudaMemcpyHostToDevice));
+            for (std::size_t i = 0; i != n * n; ++i)
+                host[i] = 2. * (double(i % 1013) / 1013.) - 1.;
+            CUDA_CHECK(cudaMemcpy(d_b, host.data(), n * n * sizeof(double),
+                                  cudaMemcpyHostToDevice));
+        }
 
         double const fp64 = gemm_rate(
             blas, n, CUBLAS_COMPUTE_64F, CUDA_R_64F, d_a, d_b, d_c);
@@ -165,6 +179,43 @@ int main(int argc, char **argv) {
         double const tf32 = gemm_rate(
             blas, n, CUBLAS_COMPUTE_32F_FAST_TF32, CUDA_R_32F, d_a, d_b, d_c);
 
+        /*  fp16 and bf16 WITH AN FP32 ACCUMULATOR — the only variant relevant
+            to Ozaki. The scheme's exactness bound is 2*bits + log2(K) <= 24,
+            and the 24 is the fp32 accumulator's mantissa, so accumulating in
+            fp32 leaves the bound unchanged and makes this a pure throughput
+            question.
+
+            Why it is worth measuring at all: fp16 carries 11 significand bits,
+            exactly as many as TF32, so a piece that fits one fits the other and
+            the piece count does not move. On consumer Blackwell the two run at
+            the SAME tensor rate, which is why fp16 was measured as 1.03-1.45x
+            slower there and dropped. That is a property of those parts, not of
+            the method, and it has to be re-asked on a datacenter part. */
+        double const fp16 = gemm_rate(
+            blas, n, CUBLAS_COMPUTE_32F, CUDA_R_16F, d_a, d_b, d_c);
+        double const bf16 = gemm_rate(
+            blas, n, CUBLAS_COMPUTE_32F, CUDA_R_16BF, d_a, d_b, d_c);
+
+        /*  EMULATED fp32 and fp64 (Blackwell, CUDA 12.9+).
+            32F_EMULATED_16BFX9 splits each fp32 operand into 3 bf16 values and
+            runs 9 tensor-core products — cuBLAS's own Ozaki. It matters here
+            because R-IR's solve is dominated by a plain SIMT fp32 GEMM (R*X)
+            running at the fp32 rate while the tensor cores idle.
+            64F_EMULATED_FIXEDPOINT matters for BASELINE FAIRNESS: if fp64 can
+            be emulated fast on this part, then "direct fp64" measured against
+            the native 1.05 TFLOP/s rate is an artificially weak baseline, and
+            any speedup quoted against it is inflated.
+
+            Emulation may be unsupported for a given shape/type, in which case
+            cuBLAS reports an error and the rate reads 0 — which is the honest
+            answer, not a failure to handle. */
+        double const fp32_emu = gemm_rate(
+            blas, n, CUBLAS_COMPUTE_32F_EMULATED_16BFX9, CUDA_R_32F,
+            d_a, d_b, d_c);
+        double const fp64_emu = gemm_rate(
+            blas, n, CUBLAS_COMPUTE_64F_EMULATED_FIXEDPOINT, CUDA_R_64F,
+            d_a, d_b, d_c);
+
         std::cout << "GEMM rates at n = " << n << "\n"
                   << "  " << std::left << std::setw(10) << "fp64"
                   << std::right << std::setw(10) << std::setprecision(2)
@@ -172,7 +223,27 @@ int main(int argc, char **argv) {
                   << "  " << std::left << std::setw(10) << "fp32"
                   << std::right << std::setw(10) << fp32 << " TFLOP/s\n"
                   << "  " << std::left << std::setw(10) << "tf32"
-                  << std::right << std::setw(10) << tf32 << " TFLOP/s\n\n";
+                  << std::right << std::setw(10) << tf32 << " TFLOP/s\n"
+                  << "  " << std::left << std::setw(10) << "fp16/fp32acc"
+                  << std::right << std::setw(10) << fp16 << " TFLOP/s\n"
+                  << "  " << std::left << std::setw(10) << "bf16/fp32acc"
+                  << std::right << std::setw(10) << bf16 << " TFLOP/s\n\n"
+                  << "  fp16 : tf32  " << std::setprecision(2)
+                  << (tf32 > 0.? fp16 / tf32 : 0.) << "x"
+                  << "   (>1 means an fp16 Ozaki path could pay;"
+                     " ~1 means it cannot)\n"
+                  << "  bf16 : tf32  " << (tf32 > 0.? bf16 / tf32 : 0.)
+                  << "x   (bf16 has 8 significand bits against tf32's 11,"
+                     " so it needs MORE pieces)\n\n"
+                  << "emulated (Blackwell)\n"
+                  << "  " << std::left << std::setw(14) << "fp32 emu bf16x9"
+                  << std::right << std::setw(10) << fp32_emu << " TFLOP/s"
+                  << "   vs native fp32 "
+                  << (fp32 > 0.? fp32_emu / fp32 : 0.) << "x\n"
+                  << "  " << std::left << std::setw(14) << "fp64 emu fixed"
+                  << std::right << std::setw(10) << fp64_emu << " TFLOP/s"
+                  << "   vs native fp64 "
+                  << (fp64 > 0.? fp64_emu / fp64 : 0.) << "x\n\n";
 
         if (fp64 > 0.) {
             double const ratio_32 = fp32 / fp64;

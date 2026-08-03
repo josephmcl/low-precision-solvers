@@ -164,7 +164,21 @@ void solve_split_mpir(
 
         /*  LU d = P r, in fp32, then X += d. */
         convert::permute_rows_demote(d_d, d_acc, st.d_perm, n, k, prob);
-        factorize::lu_solve(d_d, st.d_lu, k, prob);
+        {
+            /*  SAME blocked/emulated triangular solve the R-IR path uses.
+                lu_solve is shared, so an optimization to it belongs to BOTH
+                methods -- applying it to R-IR alone would manufacture a win
+                out of a library detail. bf16x9 is 24 significand bits, so this
+                is fp32-equivalent for the baseline too, not a precision trade
+                imposed on it. */
+            int const bnb = tuning::current().get("rir.solve.trsm_blocked", 0);
+            if (bnb > 0)
+                factorize::lu_solve_blocked(
+                    d_d, st.d_lu, k, prob, bnb,
+                    tuning::current().get("rir.solve.trsm_emulated", 1) != 0);
+            else
+                factorize::lu_solve(d_d, st.d_lu, k, prob);
+        }
         convert::add_correction(d_x, d_d, nk, prob);
 
         ++used;
