@@ -444,8 +444,26 @@ void solve_rir(
                                d_x, k, pieces_r, -1., tws, tcfg, prob);
             }
             else if (!plain_rx) {
+                /*  Ozaki R*X: exponent scan, then the split product.
+
+                    These two halves MUST stay in one branch. They were once
+                    split across `else if (!plain_rx)` and a trailing `else`,
+                    which left the product unreachable — the trailing `else` sat
+                    after `else if (plain_rx)`, so it could only be entered when
+                    plain_rx was true, and that case had already been taken. The
+                    scan ran, the product never did, and R*X was silently not
+                    subtracted at all: the residual stayed at PB and the
+                    iteration refined nothing. It read as an accuracy result
+                    (1.2e-09, exactly the no-refinement figure) rather than as
+                    the dead branch it was. */
                 ozaki::column_max(ws.d_nu, d_x, n, k, prob);
                 convert::zero(d_neg, nk, prob);
+                /*  Subtracted rather than accumulated: R is packed, so
+                    negating it in place is no longer a single kernel. */
+                ozaki::accumulate_product(
+                    d_neg, st.d_r, d_x, n, k, ozaki::shape::full, ws, prob,
+                    0, st.r_format);
+                convert::subtract(d_rhs, d_neg, nk, prob);
             }
             /*  `else if`, not `if`: this is a SECOND chain, and leaving it
                 ungated made the polish passes subtract R*X twice — once
@@ -453,7 +471,7 @@ void solve_rir(
                 a wrong answer completely insensitive to every precision knob,
                 which is what a miscounted term looks like and what a precision
                 bug never does. */
-            else if (plain_rx) {
+            else {
                 float const minus_one = -1.f, zero = 0.f;
                 convert::demote(d_xf, d_x, nk, prob);
                 CUBLAS_CHECK(cublasSgemm(
@@ -467,14 +485,6 @@ void solve_rir(
                     &zero,
                     d_rx, static_cast<int>(n)));
                 convert::add_correction(d_rhs, d_rx, nk, prob);
-            }
-            else {
-                /*  Subtracted rather than accumulated: R is packed, so
-                    negating it in place is no longer a single kernel. */
-                ozaki::accumulate_product(
-                    d_neg, st.d_r, d_x, n, k, ozaki::shape::full, ws, prob,
-                    0, st.r_format);
-                convert::subtract(d_rhs, d_neg, nk, prob);
             }
         }
 
