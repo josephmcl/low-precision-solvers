@@ -107,6 +107,18 @@ enum class shape {
 };
 
 struct config {
+    /*  Pieces for the SECOND (nominally fp64) operand, when it is not really
+        fp64. The R build promotes U out of the packed fp32 factor, so it holds
+        24 bits and needs ceil(24/bits)+1 pieces, not the full count — the same
+        asymmetry sec.85 found for the triangular operand, unexploited here
+        because this call site predates it. Pair count is what it buys:
+        the group loop issues one product per (p,q) with p+q < n_groups, so
+        capping q shrinks it quadratically.
+
+        -1 means "same as n_pieces", which is what every other call site wants:
+        split-MPIR's second operand is a genuine fp64 iterate. */
+    int n_pieces_x = -1;
+
 
     /*  Pieces per operand, and bits per piece. 9 x 6 = 54 bits, 45 products.
 

@@ -89,6 +89,7 @@ private:
     so it belongs here. */
 table &current();
 
+
 /*  Canonical file name for a device: lowercase, non-alphanumerics to
     underscores, collapsed. "NVIDIA GeForce RTX 5090" -> "nvidia_geforce_rtx_5090". */
 std::string file_name_for(std::string const &device_name);

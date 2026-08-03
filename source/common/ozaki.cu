@@ -490,6 +490,8 @@ void accumulate_product(
 
     std::size_t const b  = static_cast<std::size_t>(cfg.block);
     std::size_t const np = static_cast<std::size_t>(cfg.n_pieces);
+    /*  Pieces for the second operand; see ozaki.h. Defaults to n_pieces. */
+    int const np_x = (cfg.n_pieces_x > 0)? cfg.n_pieces_x : cfg.n_pieces;
 
     float const one = 1.f, zero = 0.f;
 
@@ -553,7 +555,7 @@ void accumulate_product(
             stride_x,
             c_0,
             n_c,
-            cfg.n_pieces,
+            np_x,
             cfg.bits);
         KERNEL_CHECK();
 
@@ -583,7 +585,7 @@ void accumulate_product(
             for (int p = 0; p <= s; ++p) {
 
                 int const q = s - p;
-                if (p >= cfg.n_pieces || q >= cfg.n_pieces)
+                if (p >= cfg.n_pieces || q >= np_x)
                     continue;
 
                 float const beta = first? zero : one;

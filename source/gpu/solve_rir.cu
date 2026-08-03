@@ -122,6 +122,11 @@ ozaki::config config_for(std::string const &prefix) {
     cfg.block      = tuning::current().get(prefix + ".ozaki.block",
                                            base.block);
     cfg.n_groups   = cfg.n_pieces;
+    /*  For the R build the second operand is U, promoted out of the packed
+        fp32 factor — 24 bits, not 53 — so it needs far fewer pieces than the
+        first. -1 leaves it equal to n_pieces, which is right for the solve
+        sites where the second operand is a genuine fp64 iterate. */
+    cfg.n_pieces_x = tuning::current().get(prefix + ".ozaki.pieces_x", -1);
     cfg.triangular =
         tuning::current().get("ozaki.triangular", 1) != 0;
     cfg.contraction_bound =
@@ -221,6 +226,14 @@ void factor_rir(state &st, problem &prob) {
     ozaki::config const cfg = config_for("rir.build");
     ozaki::workspace ws(n, nb, cfg, prob);
 
+    /*  Hoisted out of the timed region. A cudaMalloc of n^2 floats is 256 MB
+        at n=8192 and would be charged to the arithmetic — the defect the
+        caller-owned-buffer rule exists to prevent, and it was sitting inert
+        behind a default-off switch waiting for someone to turn it on. */
+    float *d_m_inverse = (tuning::current().get("rir.solve.m_form", 0) != 0)
+        ? static_cast<float *>(st.acquire(nn * sizeof(float)))
+        : nullptr;
+
     timing::stopwatch watch;
     watch.start();
 
@@ -270,8 +283,8 @@ void factor_rir(state &st, problem &prob) {
         with M^-1 about kappa*u_32 from LU, so the answer floors near 1e-9 and
         degrades with conditioning (sec.87). The form is fast and correct only
         with an fp64 inverse, which is 12n^2. */
-    if (tuning::current().get("rir.solve.m_form", 0) != 0) {
-        float *d_m = static_cast<float *>(st.acquire(nn * sizeof(float)));
+    if (d_m_inverse != nullptr) {
+        float *d_m = d_m_inverse;
         trsm::form_inverse(d_m, st.d_lu, prob);
         st.d_lu = d_m;
         st.m_form = true;

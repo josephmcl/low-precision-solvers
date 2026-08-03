@@ -26,6 +26,32 @@ namespace harness {
     optional extra — it is the case that separates the methods, and a
     result quoted only on DIAG_DOMINANT says little. */
 enum class matrix_kind {
+    /*  Standard test families from the mixed-precision refinement literature,
+        all parameterised by `shift_override` read as log10(kappa).
+
+        Built as A = Q D Q^T (symmetric, prescribed eigenvalues) or U S V^T
+        (general, prescribed singular values), with the orthogonal factors
+        formed from a small product of Householder reflectors — O(n^2) each,
+        which is enough randomisation for these tests and avoids an O(n^3) QR
+        in problem setup.
+
+        The point of having all six is that they separate properties the
+        earlier families conflate: `randsvd_log` spreads the spectrum evenly in
+        log scale, `clustered` puts everything at the extremes, `arithmetic`
+        spaces it linearly (so most values sit near the top). Positive versus
+        signed eigenvalues then separates definiteness from conditioning —
+        a signed spectrum is indefinite at the same kappa, which is where
+        pivoting starts to matter. */
+    randsvd_log,          /* singular values log-uniform over [1/kappa, 1]  */
+    eig_clustered_pos,    /* eigenvalues {1, 1/kappa, ..., 1/kappa}, > 0    */
+    eig_clustered_signed, /* same magnitudes, alternating sign              */
+    eig_arith_pos,        /* eigenvalues linearly spaced, > 0               */
+    eig_arith_signed,     /* same magnitudes, alternating sign              */
+
+    /*  A supplied by the caller — SuiteSparse via Matrix Market, densified.
+        The generator is bypassed entirely; `shift_override` is ignored. */
+    external,
+
     diag_dominant,   /* A = rand(-1,1) + n*I        -- easy               */
     moderate,        /* A = rand(-1,1) + sqrt(n)*I                        */
     near_random,     /* A = rand(-1,1) + I          -- the stress case    */
@@ -86,7 +112,8 @@ public:
         std::size_t const  k,
         matrix_kind const  kind,
         unsigned const     seed = 7u,
-        double const       shift_override = -1.);
+        double const       shift_override = -1.,
+        double const      *host_a = nullptr);
 
     ~problem();
 

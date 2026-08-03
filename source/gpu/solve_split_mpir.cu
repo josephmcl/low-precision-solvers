@@ -141,7 +141,12 @@ void solve_split_mpir(
 
     /*  A cap, not a schedule: the loop stops on its own test below and reports
         the count it used. */
-    std::size_t const cap = 8;
+    /*  Exposed for the same reason R-IR's is: so the stopping rule can be
+        checked against a forced count. Without it this method could not be
+        asked whether its 3 passes are necessary, while R-IR could — an
+        asymmetry that makes any pass-structure comparison unfair. */
+    std::size_t const cap = static_cast<std::size_t>(
+        tuning::current().get("mpir.max_outer", 8));
 
     for (std::size_t it = 0; it != cap; ++it) {
 

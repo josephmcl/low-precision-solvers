@@ -147,7 +147,8 @@ problem::problem(
     std::size_t const  k,
     matrix_kind const  kind,
     unsigned const     seed,
-    double const       shift_override)
+    double const       shift_override,
+    double const      *host_a)
     : n(n), k(k), kind(kind) {
 
     CUBLAS_CHECK(cublasCreate(&blas));
@@ -162,7 +163,27 @@ problem::problem(
         acquire(static_cast<std::size_t>(launch::MAX_BLOCKS) * sizeof(double)));
     d_residual = static_cast<double *>(acquire(n * k * sizeof(double)));
 
-    _generate(seed, shift_override);
+    if (kind == matrix_kind::external) {
+        /*  Caller-supplied A, densified from Matrix Market. B is generated the
+            same way the synthetic families generate it, so the right-hand side
+            is not a further variable between runs. */
+        if (host_a == nullptr) {
+            std::cerr << "[problem] matrix_kind::external with no host_a\n";
+            std::exit(1);
+        }
+        CUDA_CHECK(cudaMemcpy(d_a, host_a, n * n * sizeof(double),
+                              cudaMemcpyHostToDevice));
+        /*  Same right-hand side generator the synthetic families use, so B
+            is not a further variable between external and synthetic runs. */
+    generate_rhs_kernel<<<launch::grid_for(n * k), launch::BLOCK_SIZE>>>(
+            d_b,
+            n * k,
+            seed + 99u);
+        KERNEL_CHECK();
+    }
+    else {
+        _generate(seed, shift_override);
+    }
     _warm_libraries();
 }
 
@@ -187,7 +208,117 @@ void *problem::acquire(std::size_t const bytes) {
     return d_p;
 }
 
+/*  Householder-based spectral construction for the standard test families.
+
+    A = Q D Q^T for the eigenvalue families, U S V^T for randsvd. Q, U and V
+    are products of `n_reflectors` Householder matrices — each applied as a
+    rank-1 update in O(n^2), so setup stays quadratic. Two reflectors per side
+    is enough to destroy any alignment between the spectrum and the coordinate
+    axes, which is what these families exist to test; a full random orthogonal
+    factor would need an O(n^3) QR and buys nothing here.
+
+    `shift_override` is read as log10(kappa). */
+static void _spectral(std::vector<double> &a, std::size_t const n,
+                      harness::matrix_kind const kind, double const log_kappa,
+                      unsigned seed) {
+
+    auto rnd = [&seed]() {
+        seed = seed * 1664525u + 1013904223u;
+        return (static_cast<double>(seed >> 8) / 16777216.) * 2. - 1.;
+    };
+
+    double const kappa = std::pow(10., (log_kappa > 0.)? log_kappa : 6.);
+    bool const symmetric = (kind != harness::matrix_kind::randsvd_log);
+
+    /*  The spectrum. Magnitudes first, signs after, so "positive" and "signed"
+        differ in exactly one place. */
+    std::vector<double> d(n);
+    for (std::size_t i = 0; i != n; ++i) {
+        double const t = (n > 1)? static_cast<double>(i) /
+                                  static_cast<double>(n - 1) : 0.;
+        switch (kind) {
+            case harness::matrix_kind::randsvd_log:
+                d[i] = std::pow(kappa, -t);                    break;
+            case harness::matrix_kind::eig_clustered_pos:
+            case harness::matrix_kind::eig_clustered_signed:
+                d[i] = (i == 0)? 1. : 1. / kappa;              break;
+            default:  /* arithmetic */
+                d[i] = 1. - (1. - 1. / kappa) * t;             break;
+        }
+    }
+    bool const signed_spectrum =
+        kind == harness::matrix_kind::eig_clustered_signed ||
+        kind == harness::matrix_kind::eig_arith_signed;
+    if (signed_spectrum)
+        for (std::size_t i = 1; i < n; i += 2) d[i] = -d[i];
+
+    a.assign(n * n, 0.);
+    for (std::size_t i = 0; i != n; ++i) a[i + i * n] = d[i];
+
+    /*  Apply Householders: A <- H A H^T (symmetric) or H A (then A H on the
+        right with an independent reflector, for randsvd). */
+    std::vector<double> v(n), w(n);
+    int const n_reflectors = 2;
+
+    auto apply_left = [&](std::vector<double> &m) {
+        double nrm = 0.;
+        for (std::size_t i = 0; i != n; ++i) { v[i] = rnd(); nrm += v[i] * v[i]; }
+        if (nrm <= 0.) return;
+        double const beta = 2. / nrm;
+        for (std::size_t j = 0; j != n; ++j) {
+            double dot = 0.;
+            for (std::size_t i = 0; i != n; ++i) dot += v[i] * m[i + j * n];
+            dot *= beta;
+            for (std::size_t i = 0; i != n; ++i) m[i + j * n] -= dot * v[i];
+        }
+        w = v;
+    };
+    auto apply_right = [&](std::vector<double> &m, bool reuse) {
+        if (!reuse) {
+            double nrm = 0.;
+            for (std::size_t i = 0; i != n; ++i) { w[i] = rnd(); nrm += w[i] * w[i]; }
+            if (nrm <= 0.) return;
+        }
+        double nrm = 0.;
+        for (std::size_t i = 0; i != n; ++i) nrm += w[i] * w[i];
+        double const beta = 2. / nrm;
+        for (std::size_t i = 0; i != n; ++i) {
+            double dot = 0.;
+            for (std::size_t j = 0; j != n; ++j) dot += m[i + j * n] * w[j];
+            dot *= beta;
+            for (std::size_t j = 0; j != n; ++j) m[i + j * n] -= dot * w[j];
+        }
+    };
+
+    for (int r = 0; r != n_reflectors; ++r) {
+        apply_left(a);
+        /*  Symmetric families reuse the same reflector on the right, which
+            preserves symmetry exactly; randsvd draws an independent one. */
+        apply_right(a, symmetric);
+    }
+}
+
 void problem::_generate(unsigned const seed, double const shift_override) {
+
+    switch (kind) {
+        case matrix_kind::randsvd_log:
+        case matrix_kind::eig_clustered_pos:
+        case matrix_kind::eig_clustered_signed:
+        case matrix_kind::eig_arith_pos:
+        case matrix_kind::eig_arith_signed: {
+            std::vector<double> host(n * n);
+            _spectral(host, n, kind, shift_override, seed);
+            CUDA_CHECK(cudaMemcpy(d_a, host.data(), n * n * sizeof(double),
+                                  cudaMemcpyHostToDevice));
+            generate_rhs_kernel<<<launch::grid_for(n * k), launch::BLOCK_SIZE>>>(
+                d_b, n * k, seed + 99u);
+            KERNEL_CHECK();
+            CUDA_CHECK(cudaDeviceSynchronize());
+            return;
+        }
+        default: break;
+    }
+
 
     /*  The diagonal shift is what sets the conditioning, and with it whether
         the fp32 factorization leaves a small R. */
