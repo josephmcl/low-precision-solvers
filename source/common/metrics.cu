@@ -1,4 +1,8 @@
 #include "common/metrics.h"
+#include <utility>
+#include <vector>
+#include <cmath>
+#include <algorithm>
 
 namespace metrics {
 
@@ -123,6 +127,84 @@ double norm_difference(
     return finish(n_blocks, prob);
 }
 
+
+/*  Per-column sum of squares of an n x k column-major fp64 matrix.
+
+    One block per column, block-strided load, shared-memory reduction. k is
+    the right-hand-side count (up to 4096 here), so one block per column
+    saturates the machine without a second pass, and n is large enough that
+    the strided load is coalesced.
+
+    Written rather than looping cublasDnrm2 over columns: that is k kernel
+    launches (2048 at the reference shape), and the launch overhead alone
+    exceeded the residual GEMM it is measuring. */
+__global__ void column_sumsq_kernel(
+    double const      *d_m,
+    double            *d_out,
+    std::size_t const  n) {
+
+    extern __shared__ double s_red[];
+
+    std::size_t const col = blockIdx.x;
+    double acc = 0.;
+    for (std::size_t i = threadIdx.x; i < n; i += blockDim.x) {
+        double const v = d_m[i + col * n];
+        acc += v * v;
+    }
+    s_red[threadIdx.x] = acc;
+    __syncthreads();
+
+    for (unsigned s = blockDim.x / 2; s != 0; s >>= 1) {
+        if (threadIdx.x < s) s_red[threadIdx.x] += s_red[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) d_out[col] = s_red[0];
+}
+
+/*  eta_j = ||r_j|| / (||A||_F ||x_j|| + ||b_j||), returned as (max, median).
+
+    The median is taken on the host over k values -- k <= 4096, so the sort is
+    free against the GEMM that produced the residual. */
+static std::pair<double,double> rigal_gaches(
+    double const *d_r,
+    double const *d_x,
+    double const *d_b,
+    double const  norm_a_f,
+    problem      &prob) {
+
+    std::size_t const n = prob.n, k = prob.k;
+    unsigned const threads = 256;
+    std::size_t const shmem = threads * sizeof(double);
+
+    double *d_sq = static_cast<double *>(prob.acquire(3 * k * sizeof(double)));
+    double *d_sr = d_sq, *d_sx = d_sq + k, *d_sb = d_sq + 2 * k;
+
+    column_sumsq_kernel<<<static_cast<unsigned>(k), threads, shmem>>>(d_r, d_sr, n);
+    column_sumsq_kernel<<<static_cast<unsigned>(k), threads, shmem>>>(d_x, d_sx, n);
+    column_sumsq_kernel<<<static_cast<unsigned>(k), threads, shmem>>>(d_b, d_sb, n);
+    KERNEL_CHECK();
+
+    std::vector<double> h(3 * k);
+    CUDA_CHECK(cudaMemcpy(h.data(), d_sq, 3 * k * sizeof(double),
+                          cudaMemcpyDeviceToHost));
+
+    std::vector<double> eta;
+    eta.reserve(k);
+    for (std::size_t j = 0; j != k; ++j) {
+        double const rj = std::sqrt(h[j]);
+        double const xj = std::sqrt(h[k + j]);
+        double const bj = std::sqrt(h[2 * k + j]);
+        double const den = norm_a_f * xj + bj;
+        eta.push_back(den > 0. ? rj / den : 0.);
+    }
+
+    double const mx = *std::max_element(eta.begin(), eta.end());
+    std::sort(eta.begin(), eta.end());
+    double const med = (k % 2) ? eta[k / 2]
+                               : 0.5 * (eta[k / 2 - 1] + eta[k / 2]);
+    return {mx, med};
+}
+
 report evaluate(
     double const *d_x,
     double const *d_x_ref,
@@ -167,6 +249,15 @@ report evaluate(
     out.backward = (out.norm_a * out.norm_x > 0.)?
         norm_r / (out.norm_a * out.norm_x) : 0.;
     out.relative = (norm_b > 0.)? norm_r / norm_b : 0.;
+
+    /*  Standard per-RHS metric alongside the aggregate. Same residual, so
+        the two can never describe different solutions. */
+    {
+        auto const rg = rigal_gaches(prob.d_residual, d_x, prob.d_b,
+                                     out.norm_a, prob);
+        out.rg_max = rg.first;
+        out.rg_median = rg.second;
+    }
 
     if (d_x_ref != nullptr) {
         double const norm_ref = norm(d_x_ref, nk, prob);

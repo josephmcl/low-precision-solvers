@@ -73,6 +73,13 @@ ozaki::config residual_config() {
         tuning::current().get("ozaki.triangular", 1) != 0;
     cfg.contraction_bound =
         tuning::current().get("ozaki.contraction_bound", 1) != 0;
+    /*  fp16 pieces, exactly as R-IR's cascades take them. WIRED HERE FOR
+        FAIRNESS, not because split-MPIR asked for it: its solve is ~58%
+        Ozaki GEMM against R-IR's ~21%, so this optimization helps split-MPIR
+        MORE. Leaving it R-IR-only would manufacture an advantage of the same
+        kind the MPIR_PASSES default once did. */
+    cfg.fp16_pieces =
+        tuning::current().get("mpir.ozaki.fp16_pieces", 0) != 0;
     cfg.merge_tail = tuning::current().get("mpir.ozaki.merge_tail",
                                            base.merge_tail);
     return cfg;

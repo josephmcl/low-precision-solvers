@@ -81,6 +81,22 @@ std::vector<method> const &registry() {
          nullptr,
          storage::DIRECT_FP64},
 
+#if LPS_HAVE_FP64_EMULATION
+        /*  Same storage, same routines, emulated fp64 math mode. Placed
+            adjacent to the default-mode reference because the pair is the
+            comparison — quoting either alone misleads in one direction.
+
+            Absent on toolkits older than CUDA 13: the registry loses a row
+            rather than the build losing a target. A CSV with four methods and
+            one with five are told apart by the method column, so a merge
+            cannot silently mistake "not available here" for "not measured". */
+        {"direct fp64 emu",
+         factor_direct_emulated,
+         solve_direct_emulated,
+         nullptr,
+         storage::DIRECT_FP64},
+#endif
+
         {"split-MPIR",
          factor_split_mpir,
          solve_split_mpir,

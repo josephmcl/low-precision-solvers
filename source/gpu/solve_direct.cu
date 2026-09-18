@@ -115,4 +115,68 @@ void solve_direct(
     st.n_iterations = 0;
 }
 
+/*  THE SAME METHOD, WITH THE VENDOR'S EMULATED fp64 ENABLED.
+
+    WHY THIS EXISTS. `direct fp64` above calls Dgetrf/Dgetrs at the default
+    math mode, which is what a naive user gets and what every campaign before
+    L40S measured. It is not what the vendor makes available. On a part that
+    deprioritises fp64, cusolverDnSetMathMode(FP64_EMULATED_FIXEDPOINT) drives
+    BOTH routines through fixed-point emulation on the tensor cores:
+
+        L40S, n = 8192, k = 2048
+        default      factor 344.3   solve 245.3   total 589.6   bwd 7.454e-15
+        emulated     factor 126.5   solve  59.0   total 185.4   bwd 7.552e-15
+
+    3.18x faster for 1.3% backward error. That is not a mixed-precision
+    competitor to be scored as a peer -- it is a legitimate fp64 solve, and
+    quoting only the slower one overstates every speed claim against it.
+
+    THIS WAS MISSED ONCE AND THE REASON IS WORTH RECORDING. The B300 notes
+    closed this exposure after testing `cusolverDnSetEmulationStrategy` on
+    Dgetrf and `cusolverDnXgetrf` with an explicit computeType. Both are
+    no-ops. SetMathMode -- the one API already known to work for fp32, where
+    SetEmulationStrategy is accepted and silently ignored -- was never tried.
+    The tell is the OUTPUT BITS: the no-op paths leave the factor
+    bit-identical, this one does not. Timing alone cannot distinguish "ran but
+    did not help" from "never ran"; the bits can.
+
+    Both are reported. The default row is what a naive user gets; this row is
+    the fair comparison. */
+#if LPS_HAVE_FP64_EMULATION
+
+namespace {
+
+/*  Set for one call and restored, never left on the handle. prob.solver is
+    shared with sgetrf, and factorize.cu sets its own mode there -- a mode left
+    behind would silently change an unrelated method's arithmetic. Same
+    discipline as the cublasSetMathMode around lu_solve. */
+struct math_mode_guard {
+    cusolverDnHandle_t handle;
+    explicit math_mode_guard(cusolverDnHandle_t h) : handle(h) {
+        cusolverDnSetMathMode(handle, CUSOLVER_FP64_EMULATED_FIXEDPOINT_MATH);
+    }
+    ~math_mode_guard() {
+        cusolverDnSetMathMode(handle, CUSOLVER_DEFAULT_MATH);
+    }
+};
+
+} /* anonymous namespace */
+
+void factor_direct_emulated(state &st, problem &prob) {
+    math_mode_guard const guard(prob.solver);
+    factor_direct(st, prob);
+}
+
+void solve_direct_emulated(
+    double       *d_x,
+    double const *d_b,
+    state        &st,
+    problem      &prob) {
+
+    math_mode_guard const guard(prob.solver);
+    solve_direct(d_x, d_b, st, prob);
+}
+
+#endif /* LPS_HAVE_FP64_EMULATION */
+
 } /* namespace solver */

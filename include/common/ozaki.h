@@ -124,6 +124,12 @@ void compress(
     format const       f,
     problem           &prob);
 
+void compress(
+    void              *d_out,
+    float const       *d_in,
+    std::size_t const  n_elements,
+    format const       f);
+
 enum class shape {
     full,
     lower,   /* unit-diagonal L out of a packed factor */
@@ -194,6 +200,57 @@ struct config {
         silent four-order regression to whoever builds a config by hand. Worth
         1-2% when it applies. */
     int merge_tail = -1;
+
+    /*  FP16 PIECES. Store the split pieces as __half and issue the cascade's
+        GEMMs on fp16 tensor cores instead of tf32.
+
+        WHY IT IS EXACT, not a precision trade. A piece is `a` rounded to a
+        multiple of 2^(e - bits*(p+1)) and bounded by 2^(e - bits*p), so it
+        carries at most `bits` significant bits -- 6 for a stored product, 9
+        for refinement. fp16 has 11. Storing a piece in fp16 loses NOTHING;
+        only its EXPONENT range is at risk, and that is handled by scaling.
+
+        WHY SCALING IS REQUIRED. Piece p sits near 2^(e - bits*p): at bits=6,
+        p=8 that is 2^-48 below the row scale, far under fp16's 2^-14 normal
+        floor. Each piece is therefore stored pre-multiplied by
+        2^(bits*p - e), which puts every piece at O(1) regardless of p or of
+        the row's magnitude. The scale comes back out in three pieces:
+
+            2^(-bits*s)   per GROUP  -> the GEMM's alpha (s = p+q is shared)
+            2^(e_i)       per ROW    -> the fp64 fold
+            2^(f_j)       per COLUMN -> the fp64 fold
+
+        The accumulator is unchanged (fp32), so the exactness bound
+        2*bits + log2(block) <= 23 and the piece count are unchanged too.
+        This makes products FASTER, never fewer.
+
+        Measured on an RTX PRO 6000 at the cascade's real contraction lengths,
+        which is the check that matters -- a square-GEMM probe overstates it:
+
+            contraction 3072 (refinement)   tf32 195.3   fp16 362.4   1.86x
+            contraction  256 (build)        tf32 154.9   fp16 235.6   1.52x
+
+        Off by default, AND THE GATE IS AN END-TO-END A/B, NOT A RATE RATIO.
+        The probe's `fp16 : tf32` is 1.85x on B300 and would say "enable";
+        measured end to end there, fp16 is 2.7% SLOWER. Every device must be
+        A/B'd with the flag on and off. This is the fifth time in this project
+        that a GEMM-level ratio failed to predict an end-to-end outcome --
+        after the emulated getrf size gate, the sparsity collapse, the
+        emulated-fp64 R build and the fp16 blocked-triangular figure.
+
+        Measured, n = 8192 k = 2048, R-IR total, against each device's own tf32:
+
+            RTX PRO 6000   157.7 -> 137.8   1.14x   ENABLE
+            RTX 5090       242.8 -> 189.3   1.28x   ENABLE
+            H100           138.4 -> 112.1   1.23x   ENABLE
+            B200            85.3 ->  75.6   1.13x   ENABLE
+            B300            89.2 ->  91.6   0.97x   LEAVE OFF
+
+        The pattern: fp16 pays where tf32 throughput is modest relative to
+        memory bandwidth, and does not where tf32 is abundant. B300's tf32 is
+        1038 TFLOP/s against the PRO 6000's 161, so its GEMM saving is small
+        and cannot cover fp16's fixed overheads. */
+    bool fp16_pieces = false;
 
     /*  Ablation switches, on by default. Present so each structural
         optimization can be turned off individually and measured, rather than
@@ -319,6 +376,23 @@ struct workspace {
         config const      &cfg,
         problem           &prob);
 
+    /*  HANDLE-ONLY FORMS.
+
+        The cascade needs exactly two things from `problem`: the cuBLAS handle
+        and the matrix dimension. `workspace` needs neither. Taking them
+        directly lets a caller that CANNOT afford to construct a `problem` use
+        the same cascade as the solvers rather than a copy of it -- concretely
+        the streamed capacity harness, which exists precisely to never
+        materialise the 8n^2 `d_a` that problem's constructor allocates.
+
+        These are the real implementations; the `problem &` forms delegate to
+        them, so there is one body per operation and no risk of the two
+        drifting. Purely additive: no existing call site changes. */
+    workspace(
+        std::size_t const  n,
+        std::size_t const  n_rhs,
+        config const      &cfg);
+
     ~workspace();
 
     workspace(workspace const &)            = delete;
@@ -330,6 +404,26 @@ struct workspace {
 
     float *d_pieces_a = nullptr;   /* n     x block x n_pieces */
     float *d_pieces_x = nullptr;   /* block x n_rhs x n_pieces */
+
+    /*  fp16 mirrors of the two piece arrays, allocated ONLY when
+        cfg.fp16_pieces. Half the bytes of the fp32 versions, so enabling this
+        does not raise the transient footprint the `block` knob exists to
+        bound. Void so the header need not include cuda_fp16.h. */
+    void *d_pieces_a16 = nullptr;
+    void *d_pieces_x16 = nullptr;
+
+    /*  Precomputed 2^ilogbf(mu[i]) and 2^ilogbf(nu[j]), the row and column
+        exponents the fp16 splitters divide out and the fold must restore.
+
+        WHY THEY ARE PRECOMPUTED. Computing them inside the fold costs two
+        ilogbf and a DOUBLE exp2 per output element, per group, per contraction
+        block. Measured, that tripled the fold: 4.8 -> 15.0 ms on an RTX PRO
+        6000, which ate 10.2 of the 22.8 ms the fp16 GEMMs saved and INVERTED
+        the whole optimization on B300, whose tf32 is 6.4x faster so its GEMM
+        saving is proportionally smaller. They are constant across every group
+        and block, so they belong here: n + n_rhs elements, filled once. */
+    double *d_rowscale = nullptr;
+    double *d_colscale = nullptr;
     float *d_partial  = nullptr;   /* one group's fp32 partial  */
     float *d_mu       = nullptr;   /* per-row scale of A        */
     float *d_nu       = nullptr;   /* per-column scale of X     */
@@ -354,12 +448,26 @@ void row_max(
     shape const        which,
     problem           &prob);
 
+void row_max(
+    float             *d_mu,
+    void const        *d_a,
+    format const       f,
+    std::size_t const  n,
+    std::size_t const  lda,
+    shape const        which);
+
 void column_max(
     float             *d_nu,
     double const      *d_x,
     std::size_t const  n,
     std::size_t const  n_rhs,
     problem           &prob);
+
+void column_max(
+    float             *d_nu,
+    double const      *d_x,
+    std::size_t const  n,
+    std::size_t const  n_rhs);
 
 /*  d_acc += A * X, to cfg.bits_resolved() bits, accumulated in fp64.
 
@@ -391,6 +499,20 @@ void accumulate_product(
     shape const        which,
     workspace         &ws,
     problem           &prob,
+    std::size_t const  contraction_limit = 0,
+    format const       a_format = format::fp32);
+
+/*  See the handle-only note on workspace's second constructor. */
+void accumulate_product(
+    double            *d_acc,
+    void const        *d_a,
+    double const      *d_x,
+    std::size_t const  lda,
+    std::size_t const  n_rhs,
+    shape const        which,
+    workspace         &ws,
+    cublasHandle_t const blas,
+    std::size_t const  n_dim,
     std::size_t const  contraction_limit = 0,
     format const       a_format = format::fp32);
 

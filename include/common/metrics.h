@@ -44,6 +44,31 @@ struct report {
         reference was given. */
     double forward = 0.;
 
+    /*  PER-RIGHT-HAND-SIDE Rigal-Gaches normwise backward error,
+
+            eta_j = ||b_j - A x_j||_2 / (||A||_F ||x_j||_2 + ||b_j||_2),
+
+        reported as the maximum and median over the k columns.
+
+        WHY BOTH THIS AND `backward`. `backward` aggregates the whole block
+        through Frobenius norms and omits the ||b|| term, so it is neither the
+        standard metric nor able to expose a single badly-solved column inside
+        a large multi-RHS batch -- at k=2048 one bad column moves an aggregate
+        Frobenius norm by 2%. eta_max is the number a numerical-analysis
+        reader expects, and eta_max/eta_median is the check that the aggregate
+        is not hiding anything.
+
+        Including ||b_j||_2 in the denominator is what makes this Rigal-Gaches
+        rather than a residual ratio: it admits perturbations to b as well as
+        A, which is why the quantity cannot fall below u regardless of how
+        favourably ||A|| ||x|| happens to scale against ||b||. That property
+        is why it resolves the sub-u_64 readings the aggregate metric
+        produces on diagonally dominant systems.
+
+        ||A|| is Frobenius, matching norm_a; state it when quoting. */
+    double rg_max    = 0.;
+    double rg_median = 0.;
+
     double norm_a = 0.;
     double norm_x = 0.;
 };

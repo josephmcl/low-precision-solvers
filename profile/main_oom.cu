@@ -53,6 +53,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <chrono>
 
 #define CHECK(x) do { auto e_ = (x); if (e_ != cudaSuccess) { \
     std::printf("[cuda] %s at line %d\n", cudaGetErrorString(e_), __LINE__); \
@@ -200,7 +201,27 @@ struct result {
     bool   oom = false;
     double peak_gb = 0., peak_n2 = 0.;
     double backward = 0., r_norm = 0.;
+    /*  Wall-clock per phase, milliseconds. `eval_ms` is the harness's own
+        residual check, which regenerates A in FP64 block by block; it is NOT
+        part of the solve and must never be added into it. `total_ms` is
+        factor + rbuild + solve, deliberately excluding eval. */
+    double factor_ms = 0., rbuild_ms = 0., solve_ms = 0.,
+           eval_ms = 0., total_ms = 0.;
 };
+
+/*  Device-synchronised wall clock. Every phase here is seconds to minutes
+    long, so chrono around a sync is ample and avoids event bookkeeping
+    across the OOM-abort path. */
+namespace {
+using clk = std::chrono::steady_clock;
+inline clk::time_point tick() {
+    cudaDeviceSynchronize(); return clk::now();
+}
+inline double tock(clk::time_point const &t0) {
+    cudaDeviceSynchronize();
+    return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+}
+}
 
 /*  One measurement. Allocation failure returns with oom set rather than
     exiting, so a sweep can record the boundary and carry on past it. */
@@ -271,6 +292,7 @@ result run_one(std::size_t const n, std::size_t const k, bool const resident) {
 
     /*  1. Factor. A is generated straight into the fp32 array it overwrites,
         so no fp64 copy of A ever exists in streamed mode. */
+    auto t_phase = tick();
     if (resident) {
         for (std::size_t j = 0; j < n; j += nb) {
             std::size_t const n_c = (j + nb <= n)? nb : n - j;
@@ -304,7 +326,10 @@ result run_one(std::size_t const n, std::size_t const k, bool const resident) {
                          cudaMemcpyHostToDevice));
     }
 
+    res.factor_ms = tock(t_phase);
+
     /*  2. R = PA - LU, one column block at a time, A regenerated per block. */
+    t_phase = tick();
     double const one = 1., zero = 0., minus_one = -1.;
     for (std::size_t j = 0; j < n; j += nb) {
         std::size_t const n_c = (j + nb <= n)? nb : n - j;
@@ -370,7 +395,10 @@ result run_one(std::size_t const n, std::size_t const k, bool const resident) {
                         res.r_norm);
     }
 
+    res.rbuild_ms = tock(t_phase);
+
     /*  3. Solve, and evaluate the residual against a regenerated A. */
+    t_phase = tick();
     gen_rhs<<<256, 256>>>(d_b, nk, 12345u);
     CHECK(cudaMemcpy(d_rhs, d_b, nk * sizeof(double), cudaMemcpyDeviceToDevice));
 
@@ -435,8 +463,10 @@ result run_one(std::size_t const n, std::size_t const k, bool const resident) {
         add_promoted<<<256, 256>>>(d_x, d_y, nk);
     }
     CHECK(cudaDeviceSynchronize());
+    res.solve_ms = tock(t_phase);
 
     /*  Residual b - Ax, with A regenerated block by block — never resident. */
+    t_phase = tick();
     CHECK(cudaMemcpy(d_rhs, d_b, nk * sizeof(double), cudaMemcpyDeviceToDevice));
     double a_norm_sq = 0.;
     for (std::size_t j = 0; j < n; j += nb) {
@@ -453,6 +483,9 @@ result run_one(std::size_t const n, std::size_t const k, bool const resident) {
     cublasDnrm2(blas, ni * ki, d_rhs, 1, &r_nrm);
     cublasDnrm2(blas, ni * ki, d_x, 1, &x_nrm);
 
+    res.eval_ms  = tock(t_phase);
+    res.total_ms = res.factor_ms + res.rbuild_ms + res.solve_ms;
+
     res.peak_gb  = g_peak / 1e9;
     res.peak_n2  = static_cast<double>(g_peak) / (n * n);
     res.backward = r_nrm / (std::sqrt(a_norm_sq) * x_nrm);
@@ -464,6 +497,11 @@ result run_one(std::size_t const n, std::size_t const k, bool const resident) {
         std::printf("  A resident        %s\n",
                     resident? "YES (8n^2 of A)" : "NO");
         std::printf("  backward error    %.3e\n", res.backward);
+        std::printf("  factor / R build  %.1f / %.1f s\n",
+                    res.factor_ms / 1e3, res.rbuild_ms / 1e3);
+        std::printf("  solve             %.1f s\n", res.solve_ms / 1e3);
+        std::printf("  TOTAL (excl eval) %.1f s   [eval %.1f s]\n",
+                    res.total_ms / 1e3, res.eval_ms / 1e3);
     }
 
     for (void *q : g_owned) cudaFree(q);
@@ -496,7 +534,8 @@ int main(int argc, char **argv) {
     if (ns.empty()) ns.push_back(40000);
 
     if (g_csv)
-        std::cout << "n,k,mode,status,peak_gb,peak_n2,backward,r_norm\n";
+        std::cout << "n,k,mode,status,peak_gb,peak_n2,backward,r_norm,"
+                     "factor_ms,rbuild_ms,solve_ms,total_ms,eval_ms\n";
 
     for (std::size_t const n : ns) {
         std::vector<bool> modes;
@@ -511,7 +550,10 @@ int main(int argc, char **argv) {
                           << (r.resident? "resident" : "streamed") << ','
                           << (r.oom? "oom" : "ok") << ','
                           << r.peak_gb << ',' << r.peak_n2 << ','
-                          << r.backward << ',' << r.r_norm << '\n';
+                          << r.backward << ',' << r.r_norm << ','
+                          << r.factor_ms << ',' << r.rbuild_ms << ','
+                          << r.solve_ms << ',' << r.total_ms << ','
+                          << r.eval_ms << '\n';
         }
     }
     return 0;

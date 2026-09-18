@@ -190,6 +190,48 @@ void solve_direct(
     state        &st,
     problem      &prob);
 
+/*  Is the vendor's emulated fp64 math mode available in THIS toolkit?
+
+    CUSOLVER_FP64_EMULATED_FIXEDPOINT_MATH is an enumerator, not a macro, so it
+    cannot be probed with #ifdef -- the version gate is the only way to ask.
+    Measured: absent in CUDA 12.4, present in 13.0 and 13.2. A CUDA 12.4 H100
+    failed to BUILD once this method was added, which is the wrong failure: an
+    old toolkit should lose the method, not the harness.
+
+    THE THREE FEATURES SHIPPED SEPARATELY, and the version that matters is the
+    LAST one. Measured directly from the headers:
+
+        toolkit  cuBLAS 32F_EMU  cuBLAS 64F_EMU  cuSOLVER fp32  cuSOLVER fp64
+        12.4     absent          absent          absent         absent
+        13.0     present         present         present        ABSENT
+        13.2     present         present         present         present
+
+    So an emulated fp64 GEMM has been reachable since 13.0, but driving Dgetrf
+    through it needs 13.2. That is why the B300 investigation closed this
+    exposure correctly and is now reopened: SetEmulationStrategy and Xgetrf
+    were genuinely the only candidates in that toolkit, and both are no-ops.
+    The API that works did not exist yet. The archived numbers were not unfair
+    when measured; the software moved under them. */
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13020
+#define LPS_HAVE_FP64_EMULATION 1
+#else
+#define LPS_HAVE_FP64_EMULATION 0
+#endif
+
+#if LPS_HAVE_FP64_EMULATION
+/*  The same routines with cusolverDnSetMathMode(FP64_EMULATED_FIXEDPOINT).
+    Reported ALONGSIDE the default-mode reference, not instead of it: the
+    default is what a naive user gets, this is what the vendor makes available,
+    and on fp64-deprecated parts they differ by 3.18x at 1.3% backward error.
+    See the rationale block in solve_direct.cu. */
+void factor_direct_emulated(state &st, problem &prob);
+void solve_direct_emulated(
+    double       *d_x,
+    double const *d_b,
+    state        &st,
+    problem      &prob);
+#endif
+
 /*  split-MPIR: A as an unevaluated fp32 pair, Ozaki residual, no fp64
     arithmetic anywhere. 12n^2, same footprint as classical MPIR. */
 void factor_split_mpir(state &st, problem &prob);

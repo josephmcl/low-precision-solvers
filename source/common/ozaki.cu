@@ -1,6 +1,8 @@
 #include "common/ozaki.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -209,8 +211,15 @@ void compress(
     std::size_t const  n_elements,
     format const       f,
     problem           &prob) {
-
     (void) prob;
+    compress(d_out, d_in, n_elements, f);
+}
+
+void compress(
+    void              *d_out,
+    float const       *d_in,
+    std::size_t const  n_elements,
+    format const       f) {
     int const g = launch::grid_for(n_elements);
 
     switch (f) {
@@ -311,8 +320,17 @@ void row_max(
     std::size_t const  lda,
     shape const        which,
     problem           &prob) {
-
     (void) prob;
+    row_max(d_mu, d_a, f, n, lda, which);
+}
+
+void row_max(
+    float             *d_mu,
+    void const        *d_a,
+    format const       f,
+    std::size_t const  n,
+    std::size_t const  lda,
+    shape const        which) {
 
     int const g = static_cast<int>(n);
     int const w = static_cast<int>(which);
@@ -337,8 +355,15 @@ void column_max(
     std::size_t const  n,
     std::size_t const  n_rhs,
     problem           &prob) {
-
     (void) prob;
+    column_max(d_nu, d_x, n, n_rhs);
+}
+
+void column_max(
+    float             *d_nu,
+    double const      *d_x,
+    std::size_t const  n,
+    std::size_t const  n_rhs) {
 
     column_max_kernel<<<static_cast<int>(n_rhs), launch::BLOCK_SIZE>>>(
         d_nu,
@@ -486,15 +511,30 @@ workspace::workspace(
     std::size_t const  n_rhs,
     config const      &cfg,
     problem           &prob)
-    : cfg(cfg) {
-
+    : workspace(n, n_rhs, cfg) {
     (void) prob;
+}
+
+workspace::workspace(
+    std::size_t const  n,
+    std::size_t const  n_rhs,
+    config const      &cfg)
+    : cfg(cfg) {
 
     std::size_t const b  = static_cast<std::size_t>(cfg.block);
     std::size_t const np = static_cast<std::size_t>(cfg.n_pieces);
 
     d_pieces_a = static_cast<float *>(_acquire(n * b * np * sizeof(float)));
     d_pieces_x = static_cast<float *>(_acquire(b * n_rhs * np * sizeof(float)));
+
+    /*  Only when asked: half the bytes of the fp32 arrays, so the transient
+        footprint the `block` knob bounds does not grow by enabling this. */
+    if (cfg.fp16_pieces) {
+        d_pieces_a16 = _acquire(n * b * np * sizeof(__half));
+        d_pieces_x16 = _acquire(b * n_rhs * np * sizeof(__half));
+        d_rowscale   = static_cast<double *>(_acquire(n * sizeof(double)));
+        d_colscale   = static_cast<double *>(_acquire(n_rhs * sizeof(double)));
+    }
     d_partial  = static_cast<float *>(_acquire(n * n_rhs * sizeof(float)));
     d_mu       = static_cast<float *>(_acquire(n * sizeof(float)));
     d_nu       = static_cast<float *>(_acquire(n_rhs * sizeof(float)));
@@ -534,6 +574,156 @@ static int stop_after() {
     return value;
 }
 
+/*  fp16 piece splitters.
+
+    Identical arithmetic to the fp32 splitters above -- the SAME add-and-
+    subtract-S extraction, the same pieces -- differing only in that each piece
+    is written pre-scaled by 2^(bits*p - e) and stored as __half.
+
+    That scaling is what makes fp16 usable at all: piece p naturally sits near
+    2^(e - bits*p), which at bits=6, p=8 is 2^-48 below the row scale and far
+    under fp16's 2^-14 normal floor. Pre-scaling puts every piece at O(1), so
+    the exponent range stops mattering entirely.
+
+    It is LOSSLESS. A piece is a multiple of 2^(e - bits*(p+1)) bounded by
+    2^(e - bits*p), hence at most `bits` significant bits (6 or 9 here) against
+    fp16's 11. Multiplying by a power of two is exact. The scale is restored
+    downstream: 2^(-bits*s) by the GEMM's alpha, 2^(e_i) and 2^(f_j) by the
+    fp64 fold.                                                                */
+template <format F>
+__global__ void split_a_kernel_fp16(
+    __half            *d_pieces,
+    void const        *d_a,
+    float const       *d_mu,
+    std::size_t const  lda,
+    std::size_t const  stride,
+    std::size_t const  n_rows,
+    std::size_t const  row_0,
+    std::size_t const  col_0,
+    std::size_t const  n_cols,
+    int const          n_pieces,
+    int const          bits,
+    int const          which) {
+
+    std::size_t const r = blockIdx.x * blockDim.x + threadIdx.x;
+    std::size_t const c = blockIdx.y;
+
+    if (r >= n_rows)
+        return;
+
+    if (c >= n_cols) {
+        for (int p = 0; p != n_pieces; ++p)
+            d_pieces[r + c * n_rows + static_cast<std::size_t>(p) * stride] =
+                __float2half(0.f);
+        return;
+    }
+
+    std::size_t const i = row_0 + r;
+    std::size_t const j = col_0 + c;
+
+    float a = 0.f;
+    bool  live = true;
+    if (which == 1 && j >= i) live = false;
+    if (which == 2 && j <  i) live = false;
+    if (live)
+        a = read_packed<F>(d_a, i + j * lda);
+
+    int const e = ilogbf(d_mu[i]);
+
+    for (int p = 0; p != n_pieces; ++p) {
+        float const S = 1.5f * exp2f(static_cast<float>(e - bits * (p + 1) + 23));
+        float const t = (a + S) - S;
+        /*  exact: a power-of-two rescale of a value with <= bits mantissa */
+        float const h = t * exp2f(static_cast<float>(bits * p - e));
+        d_pieces[r + c * n_rows + static_cast<std::size_t>(p) * stride] =
+            __float2half(h);
+        a -= t;
+    }
+}
+
+__global__ void split_x_kernel_fp16(
+    __half            *d_pieces,
+    double const      *d_x,
+    float const       *d_nu,
+    std::size_t const  n,
+    std::size_t const  stride,
+    std::size_t const  row_0,
+    std::size_t const  n_rows,
+    int const          n_pieces,
+    int const          bits) {
+
+    extern __shared__ double s_scale16[];
+
+    std::size_t const c = blockIdx.y;
+    int const f = ilogbf(d_nu[c]);
+
+    if (threadIdx.x == 0)
+        for (int p = 0; p != n_pieces; ++p)
+            s_scale16[p] = 1.5 * exp2(
+                static_cast<double>(f - bits * (p + 1) + 52));
+    __syncthreads();
+
+    std::size_t const r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n_rows)
+        return;
+
+    double x = d_x[(row_0 + r) + c * n];
+
+    for (int p = 0; p != n_pieces; ++p) {
+        double const S = s_scale16[p];
+        double const t = (x + S) - S;
+        double const h = t * exp2(static_cast<double>(bits * p - f));
+        d_pieces[r + c * n_rows + static_cast<std::size_t>(p) * stride] =
+            __float2half(static_cast<float>(h));
+        x -= t;
+    }
+}
+
+/*  Fill 2^ilogbf(v[i]) for a scale vector. One pass over n elements, once per
+    accumulate_product call, replacing the same transcendentals recomputed per
+    OUTPUT ELEMENT per group per block. */
+__global__ void exponent_scale_kernel(
+    double            *d_out,
+    float const       *d_in,
+    std::size_t const  n_elements) {
+
+    for (std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < n_elements;
+         i += static_cast<std::size_t>(blockDim.x) * gridDim.x)
+        d_out[i] = exp2(static_cast<double>(ilogbf(d_in[i])));
+}
+
+/*  Fold for the fp16 path: restores the per-row and per-column exponents the
+    splitters divided out. The per-GROUP factor 2^(-bits*s) is already in the
+    partial, applied as the GEMM's alpha.
+
+    Two loads and two multiplies. The earlier version recomputed
+    exp2(ilogbf(mu)) and exp2(ilogbf(nu)) HERE, per element, which tripled the
+    fold and inverted the optimization on fast-tf32 parts. */
+__global__ void accumulate_kernel_scaled(
+    double            *d_acc,
+    float const       *d_partial,
+    double const      *d_rowscale,
+    double const      *d_colscale,
+    std::size_t const  n_acc,
+    std::size_t const  row_0,
+    std::size_t const  n_rows,
+    std::size_t const  n_cols) {
+
+    std::size_t const total = n_rows * n_cols;
+
+    for (std::size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total;
+         idx += static_cast<std::size_t>(blockDim.x) * gridDim.x) {
+
+        std::size_t const r = idx % n_rows;
+        std::size_t const c = idx / n_rows;
+        d_acc[(row_0 + r) + c * n_acc] +=
+            static_cast<double>(d_partial[r + c * n_rows])
+            * d_rowscale[row_0 + r] * d_colscale[c];
+    }
+}
+
 void accumulate_product(
     double            *d_acc,
     void const        *d_a,
@@ -546,7 +736,24 @@ void accumulate_product(
     std::size_t const  contraction_limit,
     format const       a_format) {
 
-    std::size_t const n  = prob.n;
+    accumulate_product(d_acc, d_a, d_x, lda, n_rhs, which, ws,
+                       prob.blas, prob.n, contraction_limit, a_format);
+}
+
+void accumulate_product(
+    double            *d_acc,
+    void const        *d_a,
+    double const      *d_x,
+    std::size_t const  lda,
+    std::size_t const  n_rhs,
+    shape const        which,
+    workspace         &ws,
+    cublasHandle_t const blas,
+    std::size_t const  n_dim,
+    std::size_t const  contraction_limit,
+    format const       a_format) {
+
+    std::size_t const n  = n_dim;
     config     const &cfg = ws.cfg;
 
     std::size_t const k_end =
@@ -561,6 +768,19 @@ void accumulate_product(
     int const np_x = (cfg.n_pieces_x > 0)? cfg.n_pieces_x : cfg.n_pieces;
 
     float const one = 1.f, zero = 0.f;
+
+    /*  fp16 path: the row and column exponents are constant for the whole
+        call, so they are computed ONCE here rather than per output element in
+        every fold. That distinction is not cosmetic -- doing it in the fold
+        tripled the fold cost (4.8 -> 15.0 ms measured) and was enough to make
+        the entire fp16 cascade a net LOSS on parts with fast tf32. */
+    if (cfg.fp16_pieces && ws.d_rowscale != nullptr) {
+        exponent_scale_kernel<<<launch::grid_for(n), launch::BLOCK_SIZE>>>(
+            ws.d_rowscale, ws.d_mu, n);
+        exponent_scale_kernel<<<launch::grid_for(n_rhs), launch::BLOCK_SIZE>>>(
+            ws.d_colscale, ws.d_nu, n_rhs);
+        KERNEL_CHECK();
+    }
 
     for (std::size_t c_0 = 0; c_0 < k_end; c_0 += b) {
 
@@ -590,6 +810,42 @@ void accumulate_product(
             static_cast<unsigned>((n_rows + launch::BLOCK_SIZE - 1) /
                                   launch::BLOCK_SIZE),
             static_cast<unsigned>(n_c));
+        bool const f16 = cfg.fp16_pieces && ws.d_pieces_a16 != nullptr;
+        /*  One-shot, to stderr: whether the fp16 path is actually live. A
+            switch that silently does nothing is the failure mode this project
+            has hit repeatedly with vendor emulation flags. */
+        if (std::getenv("LPS_OZAKI_VERBOSE") != nullptr) {
+            static int said = 0;
+            if (said < 4) {
+                ++said;
+                std::fprintf(stderr,
+                    "[ozaki] fp16_pieces=%d buf=%p -> f16 %s (bits=%d "
+                    "pieces=%d block=%d)\n",
+                    int(cfg.fp16_pieces), ws.d_pieces_a16,
+                    f16 ? "LIVE" : "OFF", cfg.bits, cfg.n_pieces, cfg.block);
+            }
+        }
+        __half *const pa16 = static_cast<__half *>(ws.d_pieces_a16);
+        __half *const px16 = static_cast<__half *>(ws.d_pieces_x16);
+
+        if (f16) {
+            switch (a_format) {
+                case format::fp32:
+                    split_a_kernel_fp16<format::fp32><<<grid_a, launch::BLOCK_SIZE>>>(
+                        pa16, d_a, ws.d_mu, lda, stride_a, n_rows, row_0, c_0,
+                        n_c, cfg.n_pieces, cfg.bits, static_cast<int>(which)); break;
+                case format::b24:
+                    split_a_kernel_fp16<format::b24><<<grid_a, launch::BLOCK_SIZE>>>(
+                        pa16, d_a, ws.d_mu, lda, stride_a, n_rows, row_0, c_0,
+                        n_c, cfg.n_pieces, cfg.bits, static_cast<int>(which)); break;
+                case format::bf16:
+                    split_a_kernel_fp16<format::bf16><<<grid_a, launch::BLOCK_SIZE>>>(
+                        pa16, d_a, ws.d_mu, lda, stride_a, n_rows, row_0, c_0,
+                        n_c, cfg.n_pieces, cfg.bits, static_cast<int>(which)); break;
+            }
+            KERNEL_CHECK();
+        }
+        else
         switch (a_format) {
             case format::fp32:
                 split_a_kernel<format::fp32><<<grid_a, launch::BLOCK_SIZE>>>(
@@ -613,6 +869,13 @@ void accumulate_product(
             static_cast<unsigned>((n_c + launch::BLOCK_SIZE - 1) /
                                   launch::BLOCK_SIZE),
             static_cast<unsigned>(n_rhs));
+        if (f16) {
+            split_x_kernel_fp16<<<grid_x, launch::BLOCK_SIZE,
+                                  np * sizeof(double)>>>(
+                px16, d_x, ws.d_nu, n, stride_x, c_0, n_c, np_x, cfg.bits);
+            KERNEL_CHECK();
+        }
+        else
         split_x_kernel<<<grid_x, launch::BLOCK_SIZE,
                          np * sizeof(double)>>>(
             ws.d_pieces_x,
@@ -657,17 +920,33 @@ void accumulate_product(
 
                 float const beta = first? zero : one;
 
+                /*  fp16 pieces were stored pre-scaled by 2^(bits*p) each, so
+                    their product carries 2^(bits*s) too much. s is shared by
+                    every product in the group, so one scalar alpha removes it
+                    exactly -- no per-element work, and the group's beta=1
+                    folding still accumulates correctly because each product
+                    is scaled before it is added. */
+                float const alpha = f16
+                    ? exp2f(-static_cast<float>(cfg.bits * s))
+                    : one;
+
                 CUBLAS_CHECK(cublasGemmEx(
-                    prob.blas,
+                    blas,
                     CUBLAS_OP_N, CUBLAS_OP_N,
                     static_cast<int>(n_rows),
                     static_cast<int>(n_rhs),
                     static_cast<int>(n_c),
-                    &one,
-                    ws.d_pieces_a + static_cast<std::size_t>(p) * stride_a,
-                    CUDA_R_32F, static_cast<int>(n_rows),
-                    ws.d_pieces_x + static_cast<std::size_t>(q) * stride_x,
-                    CUDA_R_32F, static_cast<int>(n_c),
+                    &alpha,
+                    f16 ? static_cast<void const *>(
+                              pa16 + static_cast<std::size_t>(p) * stride_a)
+                        : static_cast<void const *>(
+                              ws.d_pieces_a + static_cast<std::size_t>(p) * stride_a),
+                    f16 ? CUDA_R_16F : CUDA_R_32F, static_cast<int>(n_rows),
+                    f16 ? static_cast<void const *>(
+                              px16 + static_cast<std::size_t>(q) * stride_x)
+                        : static_cast<void const *>(
+                              ws.d_pieces_x + static_cast<std::size_t>(q) * stride_x),
+                    f16 ? CUDA_R_16F : CUDA_R_32F, static_cast<int>(n_c),
                     &beta,
                     ws.d_partial, CUDA_R_32F, static_cast<int>(n_rows),
                     /*  WHICH CEILING BINDS THE PIECE COUNT?
@@ -685,7 +964,7 @@ void accumulate_product(
                         gives 24-bit operands with the SAME accumulator. If
                         accuracy does not move, the accumulator binds and no
                         wider operand format reduces the piece count. */
-                    ozaki_compute_type(),
+                    f16 ? CUBLAS_COMPUTE_32F : ozaki_compute_type(),
                     CUBLAS_GEMM_DEFAULT));
 
                 first = false;
@@ -700,27 +979,29 @@ void accumulate_product(
                 continue;
 
             if (!first) {
-                accumulate_kernel<<<launch::grid_for(n_rows * n_rhs),
-                                    launch::BLOCK_SIZE>>>(
-                    d_acc,
-                    ws.d_partial,
-                    n,
-                    row_0,
-                    n_rows,
-                    n_rhs);
+                if (f16)
+                    accumulate_kernel_scaled<<<launch::grid_for(n_rows * n_rhs),
+                                               launch::BLOCK_SIZE>>>(
+                        d_acc, ws.d_partial, ws.d_rowscale, ws.d_colscale,
+                        n, row_0, n_rows, n_rhs);
+                else
+                    accumulate_kernel<<<launch::grid_for(n_rows * n_rhs),
+                                        launch::BLOCK_SIZE>>>(
+                        d_acc, ws.d_partial, n, row_0, n_rows, n_rhs);
                 KERNEL_CHECK();
             }
         }
 
         if (tail_open && stop_after() != 2) {
-            accumulate_kernel<<<launch::grid_for(n_rows * n_rhs),
-                                launch::BLOCK_SIZE>>>(
-                d_acc,
-                ws.d_partial,
-                n,
-                row_0,
-                n_rows,
-                n_rhs);
+            if (f16)
+                accumulate_kernel_scaled<<<launch::grid_for(n_rows * n_rhs),
+                                           launch::BLOCK_SIZE>>>(
+                    d_acc, ws.d_partial, ws.d_rowscale, ws.d_colscale,
+                    n, row_0, n_rows, n_rhs);
+            else
+                accumulate_kernel<<<launch::grid_for(n_rows * n_rhs),
+                                    launch::BLOCK_SIZE>>>(
+                    d_acc, ws.d_partial, n, row_0, n_rows, n_rhs);
             KERNEL_CHECK();
         }
     }

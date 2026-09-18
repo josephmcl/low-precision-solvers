@@ -60,6 +60,10 @@ struct row {
     std::size_t iters = 0;
     double factor_ms = 0., solve_ms = 0., total_ms = 0.;
     double backward = 0., relative = 0., forward = 0., rho = 0.;
+    /*  Per-RHS Rigal-Gaches: max and median over the k columns.
+        Appended at the END of the row so every existing parser and
+        every archived CSV stays valid. */
+    double rg_max = 0., rg_median = 0.;
     double storage_n2 = 0.;
     double r_norm = 0.;      /*  ||R||/||A||, R-IR only                     */
 };
@@ -67,7 +71,8 @@ struct row {
 void header() {
     std::cout << "matrix,param,n,k,method,iter_cap,iters,"
                  "factor_ms,solve_ms,total_ms,"
-                 "backward,relative,forward,rho,storage_n2,r_norm\n";
+                 "backward,relative,forward,rho,storage_n2,r_norm,"
+                 "rg_max,rg_median\n";
 }
 
 void emit(row const &r) {
@@ -75,7 +80,8 @@ void emit(row const &r) {
               << r.method << ',' << r.iter_cap << ',' << r.iters << ','
               << r.factor_ms << ',' << r.solve_ms << ',' << r.total_ms << ','
               << r.backward << ',' << r.relative << ',' << r.forward << ','
-              << r.rho << ',' << r.storage_n2 << ',' << r.r_norm << '\n';
+              << r.rho << ',' << r.storage_n2 << ',' << r.r_norm << ','
+              << r.rg_max << ',' << r.rg_median << '\n';
 }
 
 /*  Matrix Market reader, dense-ified.
@@ -190,8 +196,47 @@ std::vector<double> params_for(std::string const &fam) {
     problem is solved repeatedly with the cap walked upward, and the error
     after each pass falls out. It measures the solver as shipped rather than an
     instrumented copy of it. */
+/*  REFERENCE SOLUTION for the forward error.
+
+    b is drawn at random rather than formed as A*x for a known x, so no exact
+    solution exists and the forward error must be measured against a solve.
+    The reference is `direct fp64` -- cuSOLVER dgetrf/dgetrs at the default
+    math mode -- which is what the column header has always claimed.
+
+    Two consequences, both of which must be stated wherever the column is
+    quoted rather than discovered by a reader:
+
+      1. `direct fp64` IS the reference, so its own forward error is
+         identically zero by construction. That is not a measurement, and the
+         row is emitted as such.
+      2. The reference carries its own error, of order kappa*u_64. A forward
+         error at or below that is not resolved -- it says the two solutions
+         agree to the reference's accuracy, not that either is correct.
+
+    Costs one extra fp64 factor+solve per problem. */
+double const *reference_solution(
+    std::vector<solver::method> const &methods, problem &prob) {
+
+    /*  OPT-IN. This is a full fp64 factor+solve per problem -- ~16 s at
+        n=32768 -- and it exists only to populate the forward-error column.
+        A sweep that does not read that column should not pay for it. */
+    if (std::getenv("LPS_FORWARD_REF") == nullptr) return nullptr;
+
+    for (std::size_t mi = 0; mi != methods.size(); ++mi) {
+        if (std::string(methods[mi].name) != "direct fp64") continue;
+        double *d_ref = static_cast<double *>(
+            prob.acquire(prob.n * prob.k * sizeof(double)));
+        solver::state st;
+        solver::run(d_ref, prob.d_b, methods[mi], st, prob);
+        return d_ref;
+    }
+    return nullptr;   /*  registry without a direct fp64: forward stays 0 */
+}
+
+/*  d_x_ref is the reference solution for the forward error, or nullptr.
+    See reference_solution() above for what it is and what it is not. */
 void measure(row &r, solver::method const &m, problem &prob,
-             std::size_t repeats) {
+             std::size_t repeats, double const *d_x_ref = nullptr) {
 
     double *d_x = static_cast<double *>(
         prob.acquire(prob.n * prob.k * sizeof(double)));
@@ -222,7 +267,7 @@ void measure(row &r, solver::method const &m, problem &prob,
     }
     std::sort(totals.begin(), totals.end());
 
-    metrics::report const err = metrics::evaluate(d_x, nullptr, prob);
+    metrics::report const err = metrics::evaluate(d_x, d_x_ref, prob);
 
     r.method     = m.name;
     r.iters      = iters;
@@ -230,6 +275,8 @@ void measure(row &r, solver::method const &m, problem &prob,
     r.solve_ms   = solve_ms;
     r.total_ms   = totals[totals.size() / 2];
     r.backward   = err.backward;
+    r.rg_max     = err.rg_max;
+    r.rg_median  = err.rg_median;
     r.relative   = err.relative;
     r.forward    = err.forward;
     r.rho        = rho;
@@ -249,11 +296,14 @@ int main(int argc, char **argv) {
 
     std::vector<std::string> sizes    = {"4096:512"};
     std::vector<std::string> families = {"diag"};
+    std::vector<double> param_override;
+    std::vector<std::string> method_filter;
     std::vector<std::string> files;
     std::size_t repeats  = 2;
     bool per_iteration   = false;
     int  max_cap         = 6;
     bool families_explicit = false;
+    std::vector<std::string> seeds = {"7"};
 
     for (int i = 1; i < argc; ++i) {
         std::string const a = argv[i];
@@ -262,6 +312,32 @@ int main(int argc, char **argv) {
         else if (a == "--families") { families = split_list(next());
                                       families_explicit = true; }
         else if (a == "--matrices") files    = split_list(next());
+        /*  SEEDS. Every accuracy table in this project was produced at the
+            single hardcoded seed 7, which makes each backward error one draw
+            from a distribution whose width was never measured. A predecessor
+            saw a 3.6x span across draws. This makes the seed a sweepable
+            input so that span becomes an error bar rather than an omission. */
+        else if (a == "--seeds")    seeds    = split_list(next());
+        else if (a == "--methods") {
+            /*  Substring match against the registry's names, so
+                `--methods R-IR,split` selects two of five. A convergence or
+                seed sweep usually wants only the iterative methods; the
+                direct baselines cost ~16 s per solve at n=32768 and do not
+                vary with the iteration cap at all. */
+            method_filter.clear();
+            std::stringstream ss(next()); std::string t;
+            while (std::getline(ss, t, ',')) method_filter.push_back(t);
+        }
+        else if (a == "--params") {
+            /*  Override params_for(). A convergence figure wants ONE kappa,
+                and sweeping all twelve decades multiplies the run by 12x --
+                on a device where direct fp64 at n=32768 is ~16 s per solve,
+                that is the difference between minutes and hours. */
+            param_override.clear();
+            std::stringstream ss(next()); std::string t;
+            while (std::getline(ss, t, ','))
+                param_override.push_back(std::atof(t.c_str()));
+        }
         else if (a == "--repeats")  repeats  = std::atoll(next());
         else if (a == "--iters")    per_iteration = true;
         else if (a == "--max-cap")  max_cap  = std::atoi(next());
@@ -271,15 +347,26 @@ int main(int argc, char **argv) {
               "  --sizes n[:k],...      default 4096:512\n"
               "  --families f,...       shift|graded|spd|wilkinson|diag\n"
               "  --matrices f.mtx,...   Matrix Market (SuiteSparse)\n"
+              "  --seeds s,...          generator seeds (default 7)\n"
               "  --iters                per-iteration error curve\n"
               "  --max-cap N            cap ceiling for --iters (default 6)\n"
-              "  --repeats N            timing medians (default 2)\n";
+              "  --repeats N            timing medians (default 2)\n"
+              "  --params v,...         override the family's parameter sweep\n"
+              "  --methods s,...        run only methods whose name contains s\n";
             return 0;
         }
     }
 
     header();
     std::vector<solver::method> const &methods = solver::registry();
+
+    auto selected = [&](solver::method const &m) {
+        if (method_filter.empty()) return true;
+        for (std::size_t i = 0; i != method_filter.size(); ++i)
+            if (std::string(m.name).find(method_filter[i]) !=
+                std::string::npos) return true;
+        return false;
+    };
 
     /*  Synthetic families.
 
@@ -291,17 +378,26 @@ int main(int argc, char **argv) {
     if (!files.empty() && !families_explicit) families.clear();
 
     for (std::string const &fam : families) {
-        for (double const param : params_for(fam)) {
+        std::vector<double> const params =
+            param_override.empty()? params_for(fam) : param_override;
+
+        for (double const param : params) {
             for (std::string const &sz : sizes) {
+            for (std::string const &sd : seeds) {
 
                 std::size_t n = 0, k = 512;
                 { std::size_t const c = sz.find(':');
                   n = std::atoll(sz.substr(0, c).c_str());
                   if (c != std::string::npos) k = std::atoll(sz.substr(c + 1).c_str()); }
 
-                problem prob(n, k, kind_of(fam), 7u, param);
+                unsigned const seed_u =
+                    static_cast<unsigned>(std::atoi(sd.c_str()));
+                problem prob(n, k, kind_of(fam), seed_u, param);
+
+                double const *d_ref = reference_solution(methods, prob);
 
                 for (std::size_t mi = 0; mi != methods.size(); ++mi) {
+                    if (!selected(methods[mi])) continue;
                     std::vector<int> caps;
                     if (per_iteration)
                         for (int c = 1; c <= max_cap; ++c) caps.push_back(c);
@@ -310,12 +406,17 @@ int main(int argc, char **argv) {
 
                     for (int const c : caps) {
                         row r;
-                        r.matrix = fam; r.param = param;
+                        /*  Tag only when sweeping, so a single-seed run
+                            emits exactly the rows it always did and old CSVs
+                            stay comparable. */
+                        r.matrix = (seeds.size() > 1) ? (fam + "#s" + sd) : fam;
+                        r.param = param;
                         r.n = n; r.k = k; r.iter_cap = c;
-                        measure(r, methods[mi], prob, repeats);
+                        measure(r, methods[mi], prob, repeats, d_ref);
                         emit(r);
                     }
                 }
+            }
             }
         }
     }
@@ -334,11 +435,14 @@ int main(int argc, char **argv) {
 
         problem prob(n, k, harness::matrix_kind::external, 7u, 0., a.data());
 
+        double const *d_ref = reference_solution(methods, prob);
+
         for (std::size_t mi = 0; mi != methods.size(); ++mi) {
+            if (!selected(methods[mi])) continue;
             row r;
             r.matrix = stem(path); r.param = 0.;
             r.n = n; r.k = k; r.iter_cap = -1;
-            measure(r, methods[mi], prob, repeats);
+            measure(r, methods[mi], prob, repeats, d_ref);
             emit(r);
         }
     }

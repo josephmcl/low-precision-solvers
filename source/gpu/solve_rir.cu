@@ -39,11 +39,33 @@
     were artifacts of the fp32 solve. rho also sets the pass count: below 1e-3
     three polish passes suffice, near 3e-3 it takes five.
 
-    What DOES limit the method is its representation. R-IR never holds A, so
-    its best attainable answer is the exact solution of (LU + R)x = Pb. That is
-    the 8n^2-against-12n^2 trade appearing as accuracy rather than as memory,
-    and it is why vendor IRS — which keeps A in fp64 — reaches 2.85e-17 where
-    this reaches 5.27e-15. */
+    WHAT LIMITS THE METHOD, CORRECTED. This paragraph used to say the floor was
+    the representation: R-IR never holds A, so its best answer is the exact
+    solution of (LU + R)x = Pb, and that the 8n^2-against-12n^2 trade therefore
+    appears as accuracy rather than as memory.
+
+    MEASURED, that is false at 8n^2. Using the controlled perturbation below
+    (`rir.perturb_r_exp`), multiplying R by (1 + eps*u) on a B300 at n=8192
+    k=2048:
+
+        eps      backward     predicted if R-limited
+        none     5.13e-16     —
+        1e-8     5.13e-16     6.0e-16
+        1e-6     8.29e-16     6.0e-14
+
+    R can be EIGHT ORDERS sloppier with no effect on the answer. If R set the
+    floor, eps=1e-8 alone would have moved it. Sensitivity appears only at
+    1e-6, and 70x weaker than R-limited behaviour predicts.
+
+    This does not contradict the storage dial, it explains it: fp32's 24 bits
+    sit ABOVE the knee with ~4-8 bits of headroom, which is why b24 (16 bits)
+    costs 14x and bf16 (8 bits) costs 3600x. The trade is real at 7n^2 and
+    6n^2 and NOT binding at 8n^2.
+
+    At the shipped configuration the limiter is the solve and refinement chain
+    — most likely the refinement's fp32 correction solve, which is fp32 by
+    design because it sets delivered accuracy. Confirming that needs an fp64
+    correction path, which does not exist yet. */
 
 namespace solver {
 
@@ -106,6 +128,68 @@ __global__ void form_r_block_kernel(
     }
 }
 
+/*  Promote a BLOCK COLUMN of strict L out of the packed fp32 factor to fp64.
+
+    Strict: the unit diagonal is supplied by form_r_block_kernel's `- U` term,
+    exactly as in the cascade path, so entries on and above the diagonal are
+    written as zero rather than skipped -- the block feeds a dense GEMM and
+    must not carry stale values.
+
+    One block column at a time: a full fp64 L would be 8n^2 and would defeat
+    the whole scheme. */
+__global__ void promote_l_block_kernel(
+    double            *d_l,
+    float const       *d_lu,
+    std::size_t const  n,
+    std::size_t const  col_0,
+    std::size_t const  n_cols) {
+
+    std::size_t const total = n * n_cols;
+
+    for (std::size_t t = blockIdx.x * blockDim.x + threadIdx.x;
+         t < total;
+         t += static_cast<std::size_t>(blockDim.x) * gridDim.x) {
+
+        std::size_t const i = t % n;
+        std::size_t const c = col_0 + t / n;
+        d_l[t] = (i > c)? static_cast<double>(d_lu[i + c * n]) : 0.;
+    }
+}
+
+/*  Promote a ROW BLOCK of R (fp32, n x n, column major) to fp64, packed with
+    leading dimension `rows`.
+
+    Why a row block: R is n^2 and a full fp64 copy would be 8n^2, reintroducing
+    exactly the footprint the scheme exists to avoid. The output rows of R*X
+    are independent, so a block at a time is the same arithmetic with O(n) of
+    scratch.
+
+    The values are exact -- every fp32 is an fp64 -- so this promotion loses
+    nothing. What it buys is the ACCUMULATOR: the shipped path runs the product
+    in fp32, and summing n terms at 2^-24 each is what floor-investigation.md
+    measured as the limiter at large k. The file comment above the SGEMM says
+    R*X "needs no fp64" because it never cancels; that is true of cancellation
+    and false of accumulation, which is the error that actually binds. */
+__global__ void promote_r_rows_kernel(
+    double            *d_out,
+    float const       *d_r,
+    std::size_t const  n,
+    std::size_t const  row_0,
+    std::size_t const  n_rows) {
+
+    std::size_t const total = n_rows * n;
+
+    for (std::size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total;
+         idx += static_cast<std::size_t>(blockDim.x) * gridDim.x) {
+
+        std::size_t const i = idx % n_rows;
+        std::size_t const j = idx / n_rows;
+        d_out[i + j * n_rows] =
+            static_cast<double>(d_r[(row_0 + i) + j * n]);
+    }
+}
+
 /*  The two Ozaki sites want different settings — the build's operand is
     triangular and the solve's is dense — so they are keyed separately rather
     than sharing one config. A single setting is necessarily wrong at one of
@@ -133,6 +217,12 @@ ozaki::config config_for(std::string const &prefix) {
         tuning::current().get("ozaki.contraction_bound", 1) != 0;
     cfg.merge_tail = tuning::current().get(prefix + ".ozaki.merge_tail",
                                            base.merge_tail);
+    /*  Run the cascade's products on fp16 tensor cores. Per SITE, because the
+        two cascades have different contraction lengths and the advantage
+        depends on it: measured 1.86x at the refinement's block=3072 and 1.52x
+        at the build's 256. Accuracy is unaffected -- see ozaki.h. */
+    cfg.fp16_pieces =
+        tuning::current().get(prefix + ".ozaki.fp16_pieces", 0) != 0;
     return cfg;
 }
 
@@ -240,7 +330,25 @@ void factor_rir(state &st, problem &prob) {
     factorize::lu_fp32(
         st.d_lu, st.d_ipiv, st.d_perm, d_work, d_info, prob.d_a, prob);
 
-    ozaki::row_max(ws.d_mu, st.d_lu, ozaki::format::fp32, n, n, ozaki::shape::lower, prob);
+    /*  fp64 R build: strict_L * U as a plain DGEMM instead of the cascade.
+
+        Same trade as rir.solve.rx_fp64, at the other site. Measured in the
+        capacity harness at n=96,256: 21.5 s against the cascade's 39.2 s on
+        H100 (1.82x), and 103.6 s against 59.9 s on B200 (0.58x) -- opposite
+        verdicts, so this is device-gated on a measured A/B, default OFF.
+
+        There is a ceiling argument for H100 specifically: tf32 ~495 TFLOP/s
+        over the cascade's ~12 products is ~41 TFLOP/s, and fp64 dgemm already
+        achieves 41.5, so no cascade tuning can win there. */
+    bool const build_fp64 =
+        tuning::current().get("rir.build.fp64", 0) != 0;
+
+    double *d_lblk = build_fp64
+        ? static_cast<double *>(st.acquire(n * nb * sizeof(double)))
+        : nullptr;
+
+    if (!build_fp64)
+        ozaki::row_max(ws.d_mu, st.d_lu, ozaki::format::fp32, n, n, ozaki::shape::lower, prob);
 
     for (std::size_t j = 0; j < n; j += nb) {
 
@@ -251,13 +359,43 @@ void factor_rir(state &st, problem &prob) {
             d_u, st.d_lu, n, j, n_c);
         KERNEL_CHECK();
 
-        ozaki::column_max(ws.d_nu, d_u, n, n_c, prob);
+        if (!build_fp64)
+            ozaki::column_max(ws.d_nu, d_u, n, n_c, prob);
 
         CUDA_CHECK(cudaMemset(d_acc, 0, n * n_c * sizeof(double)));
 
         /*  Only contraction indices below j + n_c reach these columns: U is
             upper triangular, so its rows at or beyond that are zero here.
             Bounding the loop halves the build. */
+        if (build_fp64) {
+            /*  Accumulate over L's block columns so neither operand is ever
+                promoted whole. Contraction bounded at j + n_c for the same
+                reason as the cascade path: U is upper triangular. */
+            double const d_one = 1.;
+            std::size_t const c_lim = std::min(j + n_c, n);
+
+            for (std::size_t c0 = 0; c0 < c_lim; c0 += nb) {
+
+                std::size_t const cb = std::min(nb, c_lim - c0);
+
+                promote_l_block_kernel<<<launch::grid_for(n * cb),
+                                         launch::BLOCK_SIZE>>>(
+                    d_lblk, st.d_lu, n, c0, cb);
+                KERNEL_CHECK();
+
+                CUBLAS_CHECK(cublasDgemm(
+                    prob.blas,
+                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    static_cast<int>(n), static_cast<int>(n_c),
+                    static_cast<int>(cb),
+                    &d_one,
+                    d_lblk, static_cast<int>(n),
+                    d_u + c0, static_cast<int>(n),
+                    &d_one,
+                    d_acc, static_cast<int>(n)));
+            }
+        }
+        else
         ozaki::accumulate_product(
             d_acc, st.d_lu, d_u, n, n_c, ozaki::shape::lower, ws, prob,
             j + n_c);
@@ -377,6 +515,22 @@ void solve_rir(
         ? static_cast<float *>(st.acquire(rx_rows * n * sizeof(float)))
         : nullptr;
 
+    /*  fp64 R*X. Worth it only where fp64 runs near the fp32 rate -- 76% on
+        H100, 93% on B200, against ~3% on the fp64-poor Blackwell parts, where
+        it would be ruinous. Default OFF and device-gated on a measured A/B,
+        like every other precision switch here.
+
+        Requires R in fp32: the packed formats would need an unpack first, and
+        the point of those formats is to spend accuracy for storage, which is
+        the opposite of what this switch is for. */
+    bool const rx_fp64 =
+        tuning::current().get("rir.solve.rx_fp64", 0) != 0
+        && st.r_format == ozaki::format::fp32;
+
+    double *d_r64 = rx_fp64
+        ? static_cast<double *>(st.acquire(rx_rows * n * sizeof(double)))
+        : nullptr;
+
     /*  R*X never cancels — R is already ~2^-24 of A — which is the structural
         reason this form needs no fp64. Negated once so the residual is an
         accumulate rather than a subtract; restored before returning. */
@@ -487,6 +641,35 @@ void solve_rir(
                 a wrong answer completely insensitive to every precision knob,
                 which is what a miscounted term looks like and what a precision
                 bug never does. */
+            else if (rx_fp64) {
+                /*  d_rhs already holds PB (copied at the top of the loop), so
+                    the product accumulates into it directly with beta=1 --
+                    no fp32 staging buffer and no separate add pass. */
+                double const m1 = -1., p1 = 1.;
+
+                for (std::size_t r0 = 0; r0 < n; r0 += rx_rows) {
+
+                    std::size_t const rows =
+                        (rx_rows < n - r0)? rx_rows : n - r0;
+
+                    promote_r_rows_kernel<<<launch::grid_for(rows * n),
+                                            launch::BLOCK_SIZE>>>(
+                        d_r64, static_cast<float const *>(st.d_r),
+                        n, r0, rows);
+                    KERNEL_CHECK();
+
+                    CUBLAS_CHECK(cublasDgemm(
+                        prob.blas,
+                        CUBLAS_OP_N, CUBLAS_OP_N,
+                        static_cast<int>(rows), static_cast<int>(k),
+                        static_cast<int>(n),
+                        &m1,
+                        d_r64, static_cast<int>(rows),
+                        d_x,   static_cast<int>(n),
+                        &p1,
+                        d_rhs + r0, static_cast<int>(n)));
+                }
+            }
             else {
                 float const minus_one = -1.f, zero = 0.f;
                 convert::demote(d_xf, d_x, nk, prob);

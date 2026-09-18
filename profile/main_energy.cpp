@@ -227,11 +227,33 @@ int main(int argc, char **argv) {
     std::size_t n = 8192, k = 2048, repeats = 20, rounds = 3;
     double warmup_s = 3., soak_s = 30.;
     bool csv = false, do_settle = true;
+    std::vector<std::string> method_filter;
 
     for (int i = 1; i < argc; ++i) {
         std::string const a = argv[i];
         auto next = [&]() { return (i + 1 < argc)? argv[++i] : "0"; };
-        if      (a == "--k")         k = std::atoll(next());
+        if      (a == "--methods") {
+            /*  Substring filter over the registry.
+
+                ADDED FOR A SPECIFIC FAILURE, not for convenience. On a 32.6 GB
+                5090 at n = 32768 every method runs fine ALONE (direct fp64
+                16.4 s, IRS 8.3 s, R-IR 4.8 s) but running all five in one
+                process exhausts memory through allocator fragmentation: the
+                run faulted, poisoned the context, and the warmup loop then
+                spun ~192,000 times writing CUDA errors into the CSV while
+                reporting impossible times (R-IR "0.276 s"). One method per
+                process avoids it.
+
+                COST OF USING THIS: the rotation below exists so no method
+                always inherits the card state the previous one left, and a
+                single-method run cannot rotate. The fixed-workload warmup
+                still normalises card state before the measured region, so the
+                result is comparable -- but say which way it was produced. */
+            std::stringstream ms(next()); std::string t;
+            method_filter.clear();
+            while (std::getline(ms, t, ',')) method_filter.push_back(t);
+        }
+        else if (a == "--k")         k = std::atoll(next());
         else if (a == "--repeats")   repeats = std::atoll(next());
         else if (a == "--rounds")    rounds = std::atoll(next());
         else if (a == "--warmup")    warmup_s = std::atof(next());
@@ -279,7 +301,15 @@ int main(int argc, char **argv) {
     problem prob(n, k, harness::matrix_kind::diag_dominant);
     double *d_x = static_cast<double *>(prob.acquire(n * k * sizeof(double)));
 
-    std::vector<solver::method> const &methods = solver::registry();
+    std::vector<solver::method> const &all = solver::registry();
+    std::vector<solver::method> methods;
+    for (std::size_t i = 0; i != all.size(); ++i) {
+        bool keep = method_filter.empty();
+        for (std::size_t j = 0; !keep && j != method_filter.size(); ++j)
+            keep = std::string(all[i].name).find(method_filter[j])
+                   != std::string::npos;
+        if (keep) methods.push_back(all[i]);
+    }
 
     /*  THERMAL SOAK. The per-method warmup fixes the clock state but not the
         temperature: the card is coldest at process start, so whichever method
