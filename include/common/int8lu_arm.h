@@ -45,12 +45,18 @@ void prepare(
 double factor(state *s);
 
 /*  LU-IR against the captured operator, to the DF32 floor or the cap.
-    d_b and d_x are fp64 n-vectors in the harness's layout; d_x is written.
-    Returns elapsed milliseconds and reports the iterations used. */
+    d_b and d_x are n x k fp64, column major, as the harness holds them;
+    d_x is written. Reports the largest iteration count over the columns.
+
+    MRHS is a COLUMN LOOP: the residual and both triangular solves are
+    single-vector, so k right-hand sides cost k independent chains. Correct
+    but not competitive past small k -- the vendored block residual and the
+    SRHS apply exist for this and are not ported yet. */
 double solve(
     state        *s,
     double       *d_x,
     double const *d_b,
+    std::size_t const k,
     std::size_t  *n_iterations);
 
 /*  Copy the factored carrier and the composed permutation to the host, for

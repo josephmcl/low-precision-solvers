@@ -239,6 +239,7 @@ double solve(
     state        *s,
     double       *d_x,
     double const *d_b,
+    std::size_t const k,
     std::size_t  *n_iterations) {
 
     if (s == nullptr)
@@ -249,7 +250,16 @@ double solve(
     int const   g = (n + T - 1) / T;
     std::size_t used = 0;
 
-    LAUNCH((k_split_f64<<<g, T>>>(n, d_b, s->d_bh, s->d_bl)));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    timing::stopwatch outer;
+    outer.start();
+
+    for (std::size_t col = 0; col != k; ++col) {
+
+    double       *d_xc = d_x + col * s->n;
+    double const *d_bc = d_b + col * s->n;
+
+    LAUNCH((k_split_f64<<<g, T>>>(n, d_bc, s->d_bh, s->d_bl)));
     CUDA_CHECK(cudaMemset(s->d_xh, 0, n * sizeof(float)));
     CUDA_CHECK(cudaMemset(s->d_xl, 0, n * sizeof(float)));
 
@@ -262,16 +272,12 @@ double solve(
     if (b_norm <= 0.f)
         b_norm = 1.f;
 
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    timing::stopwatch watch;
-    watch.start();
-
     /*  A cap, not a schedule: the loop stops on its own test and reports the
         count it used. */
     std::size_t const cap = 60;
-    double best = 1e30;
-    int    stalled = 0;
+    double      best    = 1e30;
+    int         stalled = 0;
+    std::size_t it_col  = 0;
 
     for (std::size_t it = 0; it != cap; ++it) {
 
@@ -308,12 +314,18 @@ double solve(
                        s->d_yh, s->d_yl, s->d_th, s->d_tl);
         LAUNCH((add_correction_kernel<<<g, T>>>(n, s->d_yh, s->d_yl,
                                                 s->d_xh, s->d_xl)));
-        ++used;
+        ++it_col;
     }
 
-    LAUNCH((combine_kernel<<<g, T>>>(n, s->d_xh, s->d_xl, d_x)));
+    LAUNCH((combine_kernel<<<g, T>>>(n, s->d_xh, s->d_xl, d_xc)));
 
-    double const ms = watch.stop();
+    /*  Max over columns, not the last: a column that needed more passes is
+        itself worth seeing. */
+    if (it_col > used)
+        used = it_col;
+    }
+
+    double const ms = outer.stop();
 
     if (n_iterations != nullptr)
         *n_iterations = used;

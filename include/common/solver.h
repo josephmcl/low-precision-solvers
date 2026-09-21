@@ -17,6 +17,10 @@
 #include <cstddef>
 #include <vector>
 
+/*  Incomplete on purpose: the arm's header is pure but there is no reason
+    for every method to see it. solver.cu includes it to destroy the state. */
+namespace int8lu_arm { struct state; }
+
 namespace solver {
 
 using harness::problem;
@@ -77,6 +81,10 @@ struct state {
         prints "--" in those columns otherwise rather than a zero that would
         read as "free". */
     bool split_reported = false;
+
+    /*  INT-sliced arm: opaque, owns its own device memory and the vendored
+        scratch, so it is released by destroy() rather than by _d_owned. */
+    int8lu_arm::state *arm = nullptr;
 
     /*  fp32 factorization, shared by every refinement scheme. */
     float *d_lu   = nullptr;
@@ -245,6 +253,16 @@ void solve_split_mpir(
     not keep A in any form. */
 void factor_rir(state &st, problem &prob);
 void solve_rir(
+    double       *d_x,
+    double const *d_b,
+    state        &st,
+    problem      &prob);
+
+/*  INT-sliced LU: blocked right-looking LU on a DF32 carrier with int8-Ozaki
+    tensor-core trailing updates, refined by LU-IR with a DF32 residual. 16n^2
+    — the captured residual operator plus the carrier the factor consumes. */
+void factor_int8lu(state &st, problem &prob);
+void solve_int8lu(
     double       *d_x,
     double const *d_b,
     state        &st,

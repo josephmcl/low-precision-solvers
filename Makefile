@@ -50,7 +50,12 @@ $(error refusing to build: '$(FASTMATH)' in NVCCFLAGS breaks the error-free \
         transformations. --fmad=true is fine; TwoProd pins it with __fmaf_rn.)
 endif
 
-LDLIBS    := -lcublas -lcusolver
+LDLIBS    := -lcublas -lcusolver -lcuda
+
+INT8LU_OBJ  := build/gpu/factor_int8lu.o
+VENDOR_DIR  := vendor/nfp64gmresir/cuda
+VENDOR_INC  := -I$(VENDOR_DIR)
+VENDOR_OBJ  := build/gpu/panel_persist.o
 
 SRC_DIR   := source/gpu
 COM_DIR   := source/common
@@ -77,7 +82,10 @@ COMMON    := \
 	$(OBJ_DIR)/solve_direct.o \
 	$(OBJ_DIR)/solve_split_mpir.o \
 	$(OBJ_DIR)/solve_rir.o \
-	$(OBJ_DIR)/factor_solve_vendor_irs.o
+	$(OBJ_DIR)/solve_int8lu.o \
+	$(OBJ_DIR)/factor_solve_vendor_irs.o \
+	$(INT8LU_OBJ) \
+	$(VENDOR_OBJ)
 
 SWEEP_MAIN  := $(TOBJ_DIR)/main_sweep.o
 PROBE_MAIN  := $(TOBJ_DIR)/main_probe.o
@@ -91,16 +99,9 @@ ENERGY_MAIN := $(POBJ_DIR)/main_energy.o
 KCHECK_MAIN := $(POBJ_DIR)/main_kappacheck.o
 DDCHECK_MAIN:= $(TOBJ_DIR)/main_ddcheck.o
 I8PROBE_MAIN:= $(TOBJ_DIR)/main_int8lu_probe.o
-INT8LU_OBJ  := $(OBJ_DIR)/factor_int8lu.o
-VENDOR_DIR  := vendor/nfp64gmresir/cuda
-VENDOR_INC  := -I$(VENDOR_DIR)
-# The TMA path (FUSE=5) calls cuTensorMapEncodeTiled, a DRIVER API entry
-# point, so the arm needs -lcuda on top of the runtime libraries.
-INT8LU_LIBS := $(LDLIBS) -lcuda
 # panel_persist.cu is a cooperative-launch TU and must stay relocatable
 # (-dc); int8lu_factor references its launcher unconditionally, so it links
 # even when PANELPERSIST is never set.
-VENDOR_OBJ  := $(OBJ_DIR)/panel_persist.o
 
 .PHONY: all clean
 
@@ -140,8 +141,8 @@ $(INT8LU_OBJ): $(SRC_DIR)/factor_int8lu.cu | $(OBJ_DIR)
 $(OBJ_DIR)/panel_persist.o: $(VENDOR_DIR)/panel_persist.cu | $(OBJ_DIR)
 	$(NVCC) $(NVCCFLAGS) $(VENDOR_INC) -dc $< -o $@
 
-$(BIN_DIR)/lps-int8lu-probe: $(COMMON) $(COM_OBJ)/reference.o $(INT8LU_OBJ) $(VENDOR_OBJ) $(I8PROBE_MAIN) | $(BIN_DIR)
-	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(INT8LU_LIBS)
+$(BIN_DIR)/lps-int8lu-probe: $(COMMON) $(COM_OBJ)/reference.o $(I8PROBE_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
 
 # Host-only; does not link COMMON so it runs on a box with no GPU.
 $(BIN_DIR)/lps-ddcheck: $(COM_OBJ)/reference.o $(DDCHECK_MAIN) | $(BIN_DIR)

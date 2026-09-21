@@ -49,6 +49,7 @@ constexpr double VENDOR_IRS  = 12.;   /* A fp64 + LU fp32              */
 constexpr double SPLIT_MPIR  = 12.;   /* A_hi + A_lo fp32 + LU fp32    */
 constexpr double RIR_FP32_R  =  8.;   /* LU fp32 + R fp32              */
 constexpr double RIR_BF16_R  =  6.;   /* LU fp32 + R bf16              */
+constexpr double INT8LU      = 16.;   /* A DF32 + carrier DF32         */
 
 } /* namespace storage */
 

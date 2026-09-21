@@ -1,5 +1,7 @@
 #include "common/solver.h"
 
+#include "common/int8lu_arm.h"
+
 #include <cstdlib>
 #include <cstring>
 
@@ -16,6 +18,9 @@ void *state::acquire(std::size_t const bytes) {
 }
 
 state::~state() {
+
+    if (arm != nullptr)
+        int8lu_arm::destroy(arm);
 
     for (std::size_t i = 0; i != _d_owned.size(); ++i)
         CUDA_CHECK(cudaFree(_d_owned[i]));
@@ -108,6 +113,12 @@ std::vector<method> const &registry() {
          solve_rir,
          nullptr,
          storage::RIR_FP32_R},
+
+        {"int8lu",
+         factor_int8lu,
+         solve_int8lu,
+         nullptr,
+         storage::INT8LU},
 
         {"vendor IRS fp32",
          nullptr,
