@@ -325,6 +325,15 @@ void transpose_split_df32(
     problem           &prob) {
 
     (void) prob;
+    transpose_split_df32(d_hi, d_lo, d_in, n);
+}
+
+void transpose_split_df32(
+    float             *d_hi,
+    float             *d_lo,
+    double const      *d_in,
+    std::size_t const  n) {
+
     unsigned const g = static_cast<unsigned>((n + TILE_DIM - 1) / TILE_DIM);
     dim3 const grid(g, g), block(TILE_DIM, BLOCK_ROWS);
     transpose_split_kernel<<<grid, block>>>(d_hi, d_lo, d_in, n);

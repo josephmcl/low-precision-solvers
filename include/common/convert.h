@@ -107,6 +107,15 @@ void transpose_split_df32(
     std::size_t const  n,
     problem           &prob);
 
+/*  Same, for a caller that has no problem to hand -- the int8lu arm owns its
+    own buffers and never constructs one. The problem form delegates here, so
+    there is one body and the two cannot drift. */
+void transpose_split_df32(
+    float             *d_hi,
+    float             *d_lo,
+    double const      *d_in,
+    std::size_t const  n);
+
 /*  Sum of squares of an fp32 array, and of the difference of two fp64 arrays.
     Both are convergence measures rather than metrics, so they return the
     SQUARE of the norm and skip the root: a caller comparing a ratio against a
