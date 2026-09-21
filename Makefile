@@ -13,7 +13,9 @@
 NVCC      := nvcc
 CUDA_ARCH ?= native
 
-INCLUDE   := -Iinclude
+# The vendored headers are part of this build: ozaki2.h uses df32.cuh for the
+# fp64-free combine, and the arm's TU needs the whole set.
+INCLUDE   := -Iinclude -Ivendor/nfp64gmresir/cuda
 
 # wgmma and TMA exist only under the arch-specific targets (compute_90a,
 # sm_100a); -arch=sm_90 drops them silently and takes a slower path. The
@@ -76,6 +78,7 @@ COMMON    := \
 	$(COM_OBJ)/tuning.o      \
 	$(COM_OBJ)/problem.o     \
 	$(COM_OBJ)/metrics.o     \
+	$(COM_OBJ)/ozaki2.o      \
 	$(COM_OBJ)/ozaki.o       \
 	$(COM_OBJ)/trsm.o        \
 	$(COM_OBJ)/solver.o      \
@@ -99,6 +102,7 @@ ENERGY_MAIN := $(POBJ_DIR)/main_energy.o
 KCHECK_MAIN := $(POBJ_DIR)/main_kappacheck.o
 DDCHECK_MAIN:= $(TOBJ_DIR)/main_ddcheck.o
 I8PROBE_MAIN:= $(TOBJ_DIR)/main_int8lu_probe.o
+OIICRT_MAIN := $(TOBJ_DIR)/main_oii_crt.o
 # panel_persist.cu is a cooperative-launch TU and must stay relocatable
 # (-dc); int8lu_factor references its launcher unconditionally, so it links
 # even when PANELPERSIST is never set.
@@ -110,7 +114,7 @@ all: $(BIN_DIR)/lps-sweep $(BIN_DIR)/lps-probe $(BIN_DIR)/lps-ozaki-test \
      $(BIN_DIR)/lps-rcheck $(BIN_DIR)/lps-profile \
      $(BIN_DIR)/lps-oom $(BIN_DIR)/lps-energy \
      $(BIN_DIR)/lps-kappacheck $(BIN_DIR)/lps-ddcheck \
-     $(BIN_DIR)/lps-int8lu-probe
+     $(BIN_DIR)/lps-int8lu-probe $(BIN_DIR)/lps-oii-crt
 
 $(BIN_DIR)/lps-sweep: $(COMMON) $(SWEEP_MAIN) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
@@ -143,6 +147,9 @@ $(OBJ_DIR)/panel_persist.o: $(VENDOR_DIR)/panel_persist.cu | $(OBJ_DIR)
 
 $(BIN_DIR)/lps-int8lu-probe: $(COMMON) $(COM_OBJ)/reference.o $(I8PROBE_MAIN) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN_DIR)/lps-oii-crt: $(COM_OBJ)/ozaki2.o $(COM_OBJ)/error.o $(COM_OBJ)/definitions.o $(OIICRT_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcudart
 
 # Host-only; does not link COMMON so it runs on a box with no GPU.
 $(BIN_DIR)/lps-ddcheck: $(COM_OBJ)/reference.o $(DDCHECK_MAIN) | $(BIN_DIR)
