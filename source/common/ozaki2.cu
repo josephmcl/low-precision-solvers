@@ -49,6 +49,24 @@ std::int32_t mod_inverse(std::int32_t const a, std::int32_t const m) {
     return t;
 }
 
+/*  Exact split of a non-negative integer into fp32 limbs, most significant
+    first. Each limb keeps at most 24 significant bits, so it is exact in
+    fp32; the exponent range of an fp32 covers 2^64 without trouble. */
+void split_limbs(u128 v, float *out, int const limbs) {
+
+    for (int j = 0; j != limbs; ++j) {
+        if (v == 0) {
+            out[j] = 0.f;
+            continue;
+        }
+        int const bl    = bit_length(v);
+        int const shift = (bl > 24)? bl - 24 : 0;
+        u128 const hi   = (v >> shift) << shift;
+        out[j] = static_cast<float>(to_double(hi));
+        v -= hi;
+    }
+}
+
 } /* anonymous namespace */
 
 double product_bits(int const n_moduli) {
@@ -110,7 +128,14 @@ crt_constants make_crt_constants(int const n_moduli) {
 
         c.s1[i] = to_double(hi);
         c.s2[i] = to_double(v[i] - hi);
+
+        split_limbs(hi, c.s1_limb[i], MAX_LIMB);
+        split_limbs(v[i] - hi, c.s2_limb[i], MAX_LIMB);
     }
+
+    split_limbs(P, c.P_limb, MAX_LIMB);
+    c.Pinv_f   = static_cast<float>(c.Pinv);
+    c.half_P_f = static_cast<float>(0.5 * to_double(P));
 
     return c;
 }
