@@ -1,6 +1,7 @@
 #include "common/int8lu_arm.h"
 
 #include "common/convert.h"
+#include "common/oii_gemm.h"
 #include "common/definitions.h"
 #include "common/error.h"
 #include "common/timing.h"
@@ -101,6 +102,8 @@ struct state {
     std::size_t    n       = 0;
     int            b       = 0;
     int            kfac    = 0;
+    kernel         which   = kernel::sliced;
+    oii::state    *oii_s   = nullptr;
     cublasHandle_t blas    = nullptr;
     Int8LUScratch  scratch = {};
 
@@ -173,12 +176,14 @@ struct state {
 state *create(
     std::size_t const n,
     int const         b,
-    int const         kfac) {
+    int const         kfac,
+    kernel const      which) {
 
     state *s = new state;
-    s->n    = n;
-    s->b    = b;
-    s->kfac = kfac;
+    s->n     = n;
+    s->b     = b;
+    s->kfac  = kfac;
+    s->which = which;
 
     if (!CUBLAS_CHECK(cublasCreate(&s->blas))) {
         delete s;
@@ -203,6 +208,17 @@ state *create(
     s->d_nrm = static_cast<float *>(s->acquire(sizeof(float)));
 
     int8lu_scratch_alloc(s->scratch, static_cast<int>(n), b, kfac);
+
+    if (which == kernel::oii) {
+        /*  Sized for the first trailing update, which is the largest; every
+            later one is smaller and passes its own m and n. */
+        s->oii_s = oii::create(n - static_cast<std::size_t>(b), b,
+                               n - static_cast<std::size_t>(b), kfac);
+        if (s->oii_s == nullptr) {
+            destroy(s);
+            return nullptr;
+        }
+    }
     return s;
 }
 
@@ -210,6 +226,8 @@ void destroy(state *s) {
 
     if (s == nullptr)
         return;
+
+    oii::destroy(s->oii_s);
 
     for (std::size_t i = 0; i != s->marks.size(); ++i)
         CUDA_CHECK(cudaEventDestroy(s->marks[i]));
@@ -251,6 +269,71 @@ void prepare(
     s->n_marks = 0;
 }
 
+/*  Blocked right-looking LU with the Ozaki-II trailing update.
+
+    The panel, the bulk row interchange and the U12 block solve are the
+    vendored ones, called in the vendored order -- this is deliberately a
+    copy of int8lu_factor's per-panel loop with one block replaced, so the
+    two arms differ in the trailing update and in nothing else. Anything
+    the sliced arm gets from its panel, this gets identically.
+
+    What is NOT reproduced: the whole-factor CUDA graph, the async and
+    persistent panels, the look-ahead and the FUSE backends. Those are
+    built around the sliced update's schedule. The comparison this
+    supports is against the per-panel sliced path.
+
+    Returns false if a trailing update was rejected -- Ozaki-II has no
+    meaning on a zero row of L21 or a zero column of U12, and a silent
+    wrong answer there would be worse than a failed factorization. */
+bool oii_factor(
+    int const       n,
+    int const       b,
+    float          *d_ah,
+    float          *d_al,
+    int            *d_piv,
+    Int8LUScratch  &sc,
+    oii::state     *os) {
+
+    for (int p = 0; p < n; p += b) {
+
+        int const bb = (p + b <= n)? b : (n - p);
+
+        launch_panel_coop(n, p, bb, d_ah, d_al, d_piv + p, sc.gv, sc.gi);
+        if (n - bb > 0)
+            LAUNCH((k_laswp_bulk<<<(n - bb + 255) / 256, 256>>>(
+                        n, p, bb, d_piv + p, d_ah, d_al)));
+
+        if (p + bb >= n)
+            continue;
+
+        u12_blocked(n, p, bb, d_ah, d_al);
+
+        int const mp = n - p - bb;
+        int const np = mp;
+
+        /*  L21 = carrier[p+bb : n, p : p+bb], U12 = carrier[p : p+bb,
+            p+bb : n], both read in place at leading dimension n, and the
+            product subtracted into the trailing block. No gather: that is
+            what the strides are for. */
+        std::size_t const l21 = static_cast<std::size_t>(p + bb) * n + p;
+        std::size_t const u12 = static_cast<std::size_t>(p) * n + (p + bb);
+        std::size_t const s22 = static_cast<std::size_t>(p + bb) * n
+                              + (p + bb);
+
+        if (!oii::gemm_df32(os, mp, np,
+                            d_ah + l21, d_al + l21, n,
+                            d_ah + u12, d_al + u12, n,
+                            d_ah + s22, d_al + s22, n,
+                            true)) {
+            std::fprintf(stderr,
+                         "[oii-arm] trailing update rejected at panel "
+                         "p=%d (mp=%d)\n", p, mp);
+            return false;
+        }
+    }
+    return true;
+}
+
 double factor(state *s) {
 
     if (s == nullptr)
@@ -259,8 +342,14 @@ double factor(state *s) {
     timing::stopwatch watch;
     watch.start();
 
-    int8lu_factor(s->blas, static_cast<int>(s->n), s->b, s->kfac,
-                  UPD_INT8, s->d_hi, s->d_lo, s->d_piv, s->scratch);
+    if (s->which == kernel::oii) {
+        if (!oii_factor(static_cast<int>(s->n), s->b, s->d_hi, s->d_lo,
+                        s->d_piv, s->scratch, s->oii_s))
+            return -1.;
+    } else {
+        int8lu_factor(s->blas, static_cast<int>(s->n), s->b, s->kfac,
+                      UPD_INT8, s->d_hi, s->d_lo, s->d_piv, s->scratch);
+    }
 
     double const ms = watch.stop();
     s->times.factor += ms;

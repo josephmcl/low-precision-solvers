@@ -89,6 +89,7 @@ COMMON    := \
 	$(OBJ_DIR)/solve_int8lu.o \
 	$(OBJ_DIR)/factor_solve_vendor_irs.o \
 	$(INT8LU_OBJ) \
+	$(OBJ_DIR)/oii_gemm.o \
 	$(VENDOR_OBJ)
 
 SWEEP_MAIN  := $(TOBJ_DIR)/main_sweep.o
@@ -107,6 +108,7 @@ EXCRT_MAIN  := $(TOBJ_DIR)/main_exact_crt.o
 OIICRT_MAIN := $(TOBJ_DIR)/main_oii_crt.o
 LIFTD_MAIN  := $(TOBJ_DIR)/main_lift_dump.o
 OIIGEMM_MAIN:= $(TOBJ_DIR)/main_oii_gemm.o
+OIIGUARD_MAIN:= $(TOBJ_DIR)/main_oii_guard.o
 INSTR_DIR   := build/instrumented
 # panel_persist.cu is a cooperative-launch TU and must stay relocatable
 # (-dc); int8lu_factor references its launcher unconditionally, so it links
@@ -120,7 +122,8 @@ all: $(BIN_DIR)/lps-sweep $(BIN_DIR)/lps-probe $(BIN_DIR)/lps-ozaki-test \
      $(BIN_DIR)/lps-oom $(BIN_DIR)/lps-energy \
      $(BIN_DIR)/lps-kappacheck $(BIN_DIR)/lps-ddcheck \
      $(BIN_DIR)/lps-int8lu-probe $(BIN_DIR)/lps-exact-crt $(BIN_DIR)/lps-oii-crt \
-     $(BIN_DIR)/lps-lift-dump $(BIN_DIR)/lps-oii-gemm
+     $(BIN_DIR)/lps-lift-dump $(BIN_DIR)/lps-oii-gemm \
+     $(BIN_DIR)/lps-oii-guard
 
 $(BIN_DIR)/lps-sweep: $(COMMON) $(SWEEP_MAIN) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
@@ -174,6 +177,11 @@ $(BIN_DIR)/lps-lift-dump: $(COM_OBJ)/definitions.o $(COM_OBJ)/error.o \
 $(BIN_DIR)/lps-oii-gemm: $(COM_OBJ)/ozaki2.o $(COM_OBJ)/error.o \
                          $(COM_OBJ)/definitions.o $(OBJ_DIR)/oii_gemm.o \
                          $(OIIGEMM_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN_DIR)/lps-oii-guard: $(COM_OBJ)/ozaki2.o $(COM_OBJ)/error.o \
+                          $(COM_OBJ)/definitions.o $(OBJ_DIR)/oii_gemm.o \
+                          $(OIIGUARD_MAIN) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
 
 $(BIN_DIR)/lps-oii-crt: $(COM_OBJ)/ozaki2.o $(OIICRT_MAIN) | $(BIN_DIR)

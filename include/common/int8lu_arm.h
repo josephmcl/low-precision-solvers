@@ -20,17 +20,35 @@ namespace int8lu_arm {
 
 struct state;
 
+/*  Which kernel performs the trailing update. Everything else -- the
+    panel, the row interchanges, the U12 block solve, the refinement -- is
+    identical, which is the point: the two arms are then comparable on the
+    one thing that differs.
+
+    sliced  the vendored INT-sliced trailing update, k int8 slices per
+            operand and the kept-pair set i + j < k.
+    oii     Ozaki-II, N pairwise-coprime moduli, DF32 in and out and no
+            fp64 instruction. `depth` is N rather than k.
+
+    The oii arm runs the per-panel loop, not the vendored whole-factor
+    CUDA graph: the graph is built around the sliced update and its
+    schedule. It is therefore a correctness vehicle first; its timings are
+    against the per-panel sliced path, not against the graph. */
+enum class kernel { sliced, oii };
+
 /*  Resident matrix bytes per n^2: 8 for the captured residual operator plus
     8 for the factor carrier. The factorization consumes its carrier, so the
     operator the refinement needs cannot be the same array. */
 constexpr double STORAGE_N2 = 16.;
 
-/*  Allocate for an n x n solve at panel width b (256 is the tuned value) and
-    slice depth kfac. Returns null on failure. */
+/*  Allocate for an n x n solve at panel width b (256 is the tuned value)
+    and depth `kfac` -- the slice count k for the sliced kernel, the
+    modulus count N for oii. Returns null on failure. */
 state *create(
     std::size_t const n,
     int const         b,
-    int const         kfac);
+    int const         kfac,
+    kernel const      which = kernel::sliced);
 
 void destroy(state *s);
 

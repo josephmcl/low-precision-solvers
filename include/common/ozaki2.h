@@ -197,8 +197,14 @@ __host__ __device__ inline void fexp_to_pair(
 
     `lost` reports any limb that did not fit, so a too-narrow accumulator is
     visible rather than silent. */
+/*  w carries the residues, which satisfy |w_l| <= floor(p_l/2) <= 128 and
+    are therefore exact in fp32. It is a float array and not a double one
+    on purpose: the first version took `double const *` and the narrowing
+    cast compiled to a single F2F.F32.F64, one fp64 instruction in 3472 and
+    the only one in the kernel. The fp64 configuration keeps its double
+    carrier; this path never sees one. */
 __host__ __device__ inline void crt_fp32free(
-    double const        *w,
+    float const         *w,
     crt_constants const &c,
     int const            limbs,
     float               &hi,
@@ -209,7 +215,7 @@ __host__ __device__ inline void crt_fp32free(
     lost = 0.f;
 
     for (int l = 0; l != c.n_moduli; ++l) {
-        float const wl = static_cast<float>(w[l]);
+        float const wl = w[l];
         for (int j = 0; j != limbs; ++j) {
             if (c.s1_limb[l][j] != 0.f)
                 lost += grow_product(e1, c.s1_limb[l][j], wl, limbs);
