@@ -122,6 +122,7 @@ struct state {
     int *d_perm = nullptr;   /* composed permutation, host-built         */
 
     /*  Solve workspace. */
+    std::size_t rhs_cap = 0;     /* columns the solve workspace holds */
     float *d_bh = nullptr, *d_bl = nullptr;
     float *d_xh = nullptr, *d_xl = nullptr;
     float *d_rh = nullptr, *d_rl = nullptr;
@@ -296,6 +297,249 @@ void prepare(
     s->n_marks = 0;
 }
 
+/*  ---- multi-RHS triangular solve -------------------------------------
+
+    The solve was a loop over columns: k right-hand sides cost k
+    independent chains and the measured per-RHS time was flat at 19.35 ms
+    from k=1 to k=16, i.e. no amortization at all. The phase split at k=16
+    says where it all is -- TRSV 97.5 percent, residual 2.0, gather 0.2,
+    update 0.3 -- so these two kernel pairs are the whole job and the
+    residual stays per column.
+
+    Each column's arithmetic is UNCHANGED: same loop bounds, same warp
+    reduction order, same sub-block sequence. The batched path is
+    therefore bit-identical to the column loop, which is what the gate
+    checks. The win is not arithmetic, it is that one pass over L\U now
+    serves k columns and that the diagonal apply, which ran in a SINGLE
+    block, now runs in k.
+
+    Vectors are n x nrhs, column major with stride ldv, so a single-vector
+    kernel still works on any one column by pointer offset. */
+
+/*  Off-diagonal update, one warp per (row, rhs). Consecutive warps take
+    the same row across right-hand sides, so the row of L\U is fetched
+    once and serves all of them. */
+__global__ void k_trsv_off_L_mrhs(
+    int const    n,
+    int const    i0,
+    int const    ni,
+    int const    nrhs,
+    int const    ldv,
+    float const *luh,
+    float const *lul,
+    float const *yh,
+    float const *yl,
+    float const *bh,
+    float const *bl,
+    float       *rh,
+    float       *rl) {
+
+    int const gw   = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int const lane = threadIdx.x & 31;
+    if (gw >= ni * nrhs)
+        return;
+    int const r = i0 + gw / nrhs;
+    std::size_t const off = static_cast<std::size_t>(gw % nrhs) * ldv;
+
+    df32 acc = df_make(0.f, 0.f);
+    for (int j = lane; j < i0; j += 32)
+        acc = df_add_acc(acc, df_mul(
+            df_make(luh[static_cast<std::size_t>(r) * n + j],
+                    lul[static_cast<std::size_t>(r) * n + j]),
+            df_make(yh[off + j], yl[off + j])));
+    for (int o = 16; o > 0; o >>= 1) {
+        float const oh = __shfl_down_sync(0xffffffffu, acc.hi, o);
+        float const ol = __shfl_down_sync(0xffffffffu, acc.lo, o);
+        acc = df_add_acc(acc, df_make(oh, ol));
+    }
+    if (lane == 0) {
+        df32 const v = df_sub_acc(df_make(bh[off + r], bl[off + r]), acc);
+        rh[off + r] = v.hi;
+        rl[off + r] = v.lo;
+    }
+}
+
+__global__ void k_trsv_off_U_mrhs(
+    int const    n,
+    int const    i0,
+    int const    ni,
+    int const    nrhs,
+    int const    ldv,
+    float const *luh,
+    float const *lul,
+    float const *yh,
+    float const *yl,
+    float const *bh,
+    float const *bl,
+    float       *rh,
+    float       *rl) {
+
+    int const gw   = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int const lane = threadIdx.x & 31;
+    if (gw >= ni * nrhs)
+        return;
+    int const r = i0 + gw / nrhs;
+    std::size_t const off = static_cast<std::size_t>(gw % nrhs) * ldv;
+
+    df32 acc = df_make(0.f, 0.f);
+    for (int j = i0 + ni + lane; j < n; j += 32)
+        acc = df_add_acc(acc, df_mul(
+            df_make(luh[static_cast<std::size_t>(r) * n + j],
+                    lul[static_cast<std::size_t>(r) * n + j]),
+            df_make(yh[off + j], yl[off + j])));
+    for (int o = 16; o > 0; o >>= 1) {
+        float const oh = __shfl_down_sync(0xffffffffu, acc.hi, o);
+        float const ol = __shfl_down_sync(0xffffffffu, acc.lo, o);
+        acc = df_add_acc(acc, df_make(oh, ol));
+    }
+    if (lane == 0) {
+        df32 const v = df_sub_acc(df_make(bh[off + r], bl[off + r]), acc);
+        rh[off + r] = v.hi;
+        rl[off + r] = v.lo;
+    }
+}
+
+/*  Diagonal apply, one BLOCK per right-hand side. The single-RHS kernel
+    launches one block on a 132-SM device; this is the same body with the
+    vectors offset, so k right-hand sides fill k blocks. */
+__global__ void k_diag_apply_L_mrhs(
+    int const    n,
+    int const    i0,
+    int const    ni,
+    int const    ib,
+    int const    ldv,
+    float const *luh,
+    float const *lul,
+    float const *dh,
+    float const *dl,
+    float const *rh,
+    float const *rl,
+    float       *yh,
+    float       *yl) {
+
+    __shared__ float ys[256], yls[256], rrh[256], rrl[256];
+    int const t = threadIdx.x;
+    std::size_t const off = static_cast<std::size_t>(blockIdx.x) * ldv;
+
+    for (int sb = 0; sb < ni; sb += ib) {
+        int const sw = (ni - sb < ib)? (ni - sb) : ib;
+        if (t < sw) {
+            df32 rr = df_make(rh[off + i0 + sb + t], rl[off + i0 + sb + t]);
+            for (int j = 0; j < sb; ++j)
+                rr = df_sub_acc(rr, df_mul(
+                    df_make(luh[static_cast<std::size_t>(i0 + sb + t) * n + (i0 + j)],
+                            lul[static_cast<std::size_t>(i0 + sb + t) * n + (i0 + j)]),
+                    df_make(ys[j], yls[j])));
+            rrh[t] = rr.hi;
+            rrl[t] = rr.lo;
+        }
+        __syncthreads();
+        if (t < sw) {
+            float const *mh = dh + static_cast<std::size_t>((i0 + sb) / ib) * ib * ib;
+            float const *ml = dl + static_cast<std::size_t>((i0 + sb) / ib) * ib * ib;
+            df32 acc = df_make(0.f, 0.f);
+            for (int q = 0; q < sw; ++q)
+                acc = df_add_acc(acc, df_mul(df_make(mh[t * ib + q], ml[t * ib + q]),
+                                             df_make(rrh[q], rrl[q])));
+            ys[sb + t]  = acc.hi;
+            yls[sb + t] = acc.lo;
+        }
+        __syncthreads();
+    }
+    for (int m = t; m < ni; m += blockDim.x) {
+        yh[off + i0 + m] = ys[m];
+        yl[off + i0 + m] = yls[m];
+    }
+}
+
+__global__ void k_diag_apply_U_mrhs(
+    int const    n,
+    int const    i0,
+    int const    ni,
+    int const    ib,
+    int const    ldv,
+    float const *luh,
+    float const *lul,
+    float const *dh,
+    float const *dl,
+    float const *rh,
+    float const *rl,
+    float       *yh,
+    float       *yl) {
+
+    __shared__ float ys[256], yls[256], rrh[256], rrl[256];
+    int const t = threadIdx.x;
+    std::size_t const off = static_cast<std::size_t>(blockIdx.x) * ldv;
+
+    for (int sb = ((ni - 1) / ib) * ib; sb >= 0; sb -= ib) {
+        int const sw = (sb + ib <= ni)? ib : (ni - sb);
+        if (t < sw) {
+            df32 rr = df_make(rh[off + i0 + sb + t], rl[off + i0 + sb + t]);
+            for (int j = sb + sw; j < ni; ++j)
+                rr = df_sub_acc(rr, df_mul(
+                    df_make(luh[static_cast<std::size_t>(i0 + sb + t) * n + (i0 + j)],
+                            lul[static_cast<std::size_t>(i0 + sb + t) * n + (i0 + j)]),
+                    df_make(ys[j], yls[j])));
+            rrh[t] = rr.hi;
+            rrl[t] = rr.lo;
+        }
+        __syncthreads();
+        if (t < sw) {
+            float const *mh = dh + static_cast<std::size_t>((i0 + sb) / ib) * ib * ib;
+            float const *ml = dl + static_cast<std::size_t>((i0 + sb) / ib) * ib * ib;
+            df32 acc = df_make(0.f, 0.f);
+            for (int q = 0; q < sw; ++q)
+                acc = df_add_acc(acc, df_mul(df_make(mh[t * ib + q], ml[t * ib + q]),
+                                             df_make(rrh[q], rrl[q])));
+            ys[sb + t]  = acc.hi;
+            yls[sb + t] = acc.lo;
+        }
+        __syncthreads();
+    }
+    for (int m = t; m < ni; m += blockDim.x) {
+        yh[off + i0 + m] = ys[m];
+        yl[off + i0 + m] = yls[m];
+    }
+}
+
+/*  The blocked drivers, batched. Same block sequence as the vendored
+    single-vector ones, so each column sees the identical order. */
+void trsv_L_mrhs(
+    int const n, int const blk, int const ib, int const nrhs, int const ldv,
+    float const *luh, float const *lul, float const *dlh, float const *dll,
+    float const *bh, float const *bl, float *yh, float *yl,
+    float *rh, float *rl) {
+
+    for (int i0 = 0; i0 < n; i0 += blk) {
+        int const ni = (i0 + blk <= n)? blk : (n - i0);
+        int const w  = ni * nrhs * 32;
+        k_trsv_off_L_mrhs<<<(w + 255) / 256, 256>>>(
+            n, i0, ni, nrhs, ldv, luh, lul, yh, yl, bh, bl, rh, rl);
+        KERNEL_CHECK();
+        k_diag_apply_L_mrhs<<<nrhs, 256>>>(
+            n, i0, ni, ib, ldv, luh, lul, dlh, dll, rh, rl, yh, yl);
+        KERNEL_CHECK();
+    }
+}
+
+void trsv_U_mrhs(
+    int const n, int const blk, int const ib, int const nrhs, int const ldv,
+    float const *luh, float const *lul, float const *duh, float const *dul,
+    float const *bh, float const *bl, float *yh, float *yl,
+    float *rh, float *rl) {
+
+    for (int i0 = ((n - 1) / blk) * blk; i0 >= 0; i0 -= blk) {
+        int const ni = (i0 + blk <= n)? blk : (n - i0);
+        int const w  = ni * nrhs * 32;
+        k_trsv_off_U_mrhs<<<(w + 255) / 256, 256>>>(
+            n, i0, ni, nrhs, ldv, luh, lul, yh, yl, bh, bl, rh, rl);
+        KERNEL_CHECK();
+        k_diag_apply_U_mrhs<<<nrhs, 256>>>(
+            n, i0, ni, ib, ldv, luh, lul, duh, dul, rh, rl, yh, yl);
+        KERNEL_CHECK();
+    }
+}
+
 /*  Blocked right-looking LU with the Ozaki-II trailing update.
 
     The panel, the bulk row interchange and the U12 block solve are the
@@ -416,6 +660,28 @@ double factor(state *s) {
     return ms;
 }
 
+/*  Grow the solve workspace to hold `k` columns. The triangular solve's
+    scratch (d_th/d_tl) stays one vector wide only in the single-column
+    path; the batched kernels write per column, so it grows too. */
+bool ensure_rhs(state *s, std::size_t const k) {
+
+    if (k <= s->rhs_cap)
+        return true;
+
+    float **const work[] = {&s->d_bh, &s->d_bl, &s->d_xh, &s->d_xl,
+                            &s->d_rh, &s->d_rl, &s->d_yh, &s->d_yl,
+                            &s->d_zh, &s->d_zl, &s->d_th, &s->d_tl};
+    std::size_t const bytes = s->n * k * sizeof(float);
+    for (std::size_t i = 0; i != sizeof work / sizeof *work; ++i) {
+        void *p = s->acquire(bytes);
+        if (p == nullptr)
+            return false;
+        *work[i] = static_cast<float *>(p);
+    }
+    s->rhs_cap = k;
+    return true;
+}
+
 double solve(
     state        *s,
     double       *d_x,
@@ -438,96 +704,144 @@ double solve(
     timing::stopwatch outer;
     outer.start();
 
-    for (std::size_t col = 0; col != k; ++col) {
+    /*  Grow the solve workspace to k columns, n x k column major so a
+        single-vector kernel still works on one column by pointer offset.
+        Allocated here and not in create() because create() does not know
+        k; it happens once per distinct k, not per solve. */
+    if (!ensure_rhs(s, k))
+        return 0.;
 
-    double       *d_xc = d_x + col * s->n;
-    double const *d_bc = d_b + col * s->n;
+    std::size_t const nk = s->n * k;
+    std::size_t const ld = s->n;
 
-    LAUNCH((k_split_f64<<<g, T>>>(n, d_bc, s->d_bh, s->d_bl)));
-    CUDA_CHECK(cudaMemset(s->d_xh, 0, n * sizeof(float)));
-    CUDA_CHECK(cudaMemset(s->d_xl, 0, n * sizeof(float)));
+    LAUNCH((k_split_f64<<<(int)((nk + T - 1) / T), T>>>(
+        (int)nk, d_b, s->d_bh, s->d_bl)));
+    CUDA_CHECK(cudaMemset(s->d_xh, 0, nk * sizeof(float)));
+    CUDA_CHECK(cudaMemset(s->d_xl, 0, nk * sizeof(float)));
 
-    /*  ||b||_inf, for the relative stopping test. */
-    CUDA_CHECK(cudaMemset(s->d_nrm, 0, sizeof(float)));
-    LAUNCH((max_abs_kernel<<<g, T>>>(n, s->d_bh, s->d_nrm)));
-    float b_norm = 0.f;
-    CUDA_CHECK(cudaMemcpy(&b_norm, s->d_nrm, sizeof(float),
-                          cudaMemcpyDeviceToHost));
-    if (b_norm <= 0.f)
-        b_norm = 1.f;
+    /*  ||b||_inf per column, for each column's relative stopping test. */
+    std::vector<float> b_norm(k, 1.f);
+    for (std::size_t c = 0; c != k; ++c) {
+        CUDA_CHECK(cudaMemset(s->d_nrm, 0, sizeof(float)));
+        LAUNCH((max_abs_kernel<<<g, T>>>(n, s->d_bh + c * ld, s->d_nrm)));
+        float v = 0.f;
+        CUDA_CHECK(cudaMemcpy(&v, s->d_nrm, sizeof(float),
+                              cudaMemcpyDeviceToHost));
+        b_norm[c] = (v > 0.f)? v : 1.f;
+    }
     s->mark(3);
 
-    /*  A cap, not a schedule: the loop stops on its own test and reports the
-        count it used. */
+    /*  Per-column refinement state. Every column is carried through every
+        pass of the batched solve, but a column that has met its own test
+        stops taking the correction -- so its answer is what the column
+        loop would have produced, bit for bit, and the batching costs it
+        only wasted work. */
     std::size_t const cap = 60;
-    double      best    = 1e30;
-    int         stalled = 0;
-    std::size_t it_col  = 0;
+    std::vector<double>      best(k, 1e30);
+    std::vector<int>         stalled(k, 0);
+    std::vector<char>        done(k, 0);
+    std::vector<std::size_t> it_col(k, 0);
 
     for (std::size_t it = 0; it != cap; ++it) {
 
-        LAUNCH((k_df_residual_warp<<<(n * 32 + T - 1) / T, T>>>(
-            n, s->d_ah, s->d_al, s->d_xh, s->d_xl, s->d_bh, s->d_bl,
-            s->d_rh, s->d_rl)));
+        for (std::size_t c = 0; c != k; ++c) {
+            if (done[c])
+                continue;
+            LAUNCH((k_df_residual_warp<<<(n * 32 + T - 1) / T, T>>>(
+                n, s->d_ah, s->d_al, s->d_xh + c * ld, s->d_xl + c * ld,
+                s->d_bh + c * ld, s->d_bl + c * ld,
+                s->d_rh + c * ld, s->d_rl + c * ld)));
+        }
 
-        CUDA_CHECK(cudaMemset(s->d_nrm, 0, sizeof(float)));
-        LAUNCH((max_abs_kernel<<<g, T>>>(n, s->d_rh, s->d_nrm)));
-        float r_norm = 0.f;
-        CUDA_CHECK(cudaMemcpy(&r_norm, s->d_nrm, sizeof(float),
-                              cudaMemcpyDeviceToHost));
-
-        /*  The reduction belongs to the residual: it is what the residual
-            is for, and its D2H is the sync the loop already pays. */
+        std::size_t n_active = 0;
+        for (std::size_t c = 0; c != k; ++c) {
+            if (done[c])
+                continue;
+            CUDA_CHECK(cudaMemset(s->d_nrm, 0, sizeof(float)));
+            LAUNCH((max_abs_kernel<<<g, T>>>(n, s->d_rh + c * ld,
+                                             s->d_nrm)));
+            float r_norm = 0.f;
+            CUDA_CHECK(cudaMemcpy(&r_norm, s->d_nrm, sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+            double const rel = static_cast<double>(r_norm) /
+                               static_cast<double>(b_norm[c]);
+            if (rel < 1e-14) {
+                done[c] = 1;
+                continue;
+            }
+            if (rel < 0.7 * best[c]) {
+                best[c] = rel;
+                stalled[c] = 0;
+            } else if (++stalled[c] >= 2 && it > 3) {
+                done[c] = 1;
+                continue;
+            }
+            ++n_active;
+        }
         s->mark(0);
 
-        double const rel = static_cast<double>(r_norm) /
-                           static_cast<double>(b_norm);
-        if (rel < 1e-14)
+        if (n_active == 0)
             break;
 
-        /*  Two tests, as the other iterative methods here use: stalling
-            alone never fires once the correction reaches zero, convergence
-            alone never fires on a problem that plateaus. */
-        if (rel < 0.7 * best) {
-            best = rel;
-            stalled = 0;
+        for (std::size_t c = 0; c != k; ++c) {
+            if (done[c])
+                continue;
+            LAUNCH((gather_kernel<<<g, T>>>(n, s->d_perm,
+                                            s->d_rh + c * ld,
+                                            s->d_rl + c * ld,
+                                            s->d_yh + c * ld,
+                                            s->d_yl + c * ld)));
         }
-        else if (++stalled >= 2 && it > 3)
-            break;
-
-        LAUNCH((gather_kernel<<<g, T>>>(n, s->d_perm, s->d_rh, s->d_rl,
-                                        s->d_yh, s->d_yl)));
         s->mark(1);
 
+        /*  One batched pass over every column, converged ones included:
+            compacting the active set would move columns in memory and
+            buy nothing, since the pass is dominated by the shared walk
+            over L\U rather than by the per-column arithmetic. */
         if (s->srung_ib != 0) {
-            trsv_L_blocked_inv(n, 256, s->srung_ib, s->d_hi, s->d_lo,
-                               s->d_dlh, s->d_dll, s->d_yh, s->d_yl,
-                               s->d_zh, s->d_zl, s->d_th, s->d_tl);
-            trsv_U_blocked_inv(n, 256, s->srung_ib, s->d_hi, s->d_lo,
-                               s->d_duh, s->d_dul, s->d_zh, s->d_zl,
-                               s->d_yh, s->d_yl, s->d_th, s->d_tl);
+            trsv_L_mrhs(n, 256, s->srung_ib, (int)k, (int)ld,
+                        s->d_hi, s->d_lo, s->d_dlh, s->d_dll,
+                        s->d_yh, s->d_yl, s->d_zh, s->d_zl,
+                        s->d_th, s->d_tl);
+            trsv_U_mrhs(n, 256, s->srung_ib, (int)k, (int)ld,
+                        s->d_hi, s->d_lo, s->d_duh, s->d_dul,
+                        s->d_zh, s->d_zl, s->d_yh, s->d_yl,
+                        s->d_th, s->d_tl);
         } else {
-            trsv_L_blocked(n, 256, s->d_hi, s->d_lo, s->d_yh, s->d_yl,
-                           s->d_zh, s->d_zl, s->d_th, s->d_tl);
-            trsv_U_blocked(n, 256, s->d_hi, s->d_lo, s->d_zh, s->d_zl,
-                           s->d_yh, s->d_yl, s->d_th, s->d_tl);
+            for (std::size_t c = 0; c != k; ++c) {
+                if (done[c])
+                    continue;
+                trsv_L_blocked(n, 256, s->d_hi, s->d_lo,
+                               s->d_yh + c * ld, s->d_yl + c * ld,
+                               s->d_zh + c * ld, s->d_zl + c * ld,
+                               s->d_th, s->d_tl);
+                trsv_U_blocked(n, 256, s->d_hi, s->d_lo,
+                               s->d_zh + c * ld, s->d_zl + c * ld,
+                               s->d_yh + c * ld, s->d_yl + c * ld,
+                               s->d_th, s->d_tl);
+            }
         }
         s->mark(2);
 
-        LAUNCH((add_correction_kernel<<<g, T>>>(n, s->d_yh, s->d_yl,
-                                                s->d_xh, s->d_xl)));
+        for (std::size_t c = 0; c != k; ++c) {
+            if (done[c])
+                continue;
+            LAUNCH((add_correction_kernel<<<g, T>>>(
+                n, s->d_yh + c * ld, s->d_yl + c * ld,
+                s->d_xh + c * ld, s->d_xl + c * ld)));
+            ++it_col[c];
+        }
         s->mark(3);
-        ++it_col;
     }
 
-    LAUNCH((combine_kernel<<<g, T>>>(n, s->d_xh, s->d_xl, d_xc)));
+    for (std::size_t c = 0; c != k; ++c) {
+        LAUNCH((combine_kernel<<<g, T>>>(n, s->d_xh + c * ld,
+                                         s->d_xl + c * ld,
+                                         d_x + c * s->n)));
+        if (it_col[c] > used)
+            used = it_col[c];
+    }
     s->mark(3);
-
-    /*  Max over columns, not the last: a column that needed more passes is
-        itself worth seeing. */
-    if (it_col > used)
-        used = it_col;
-    }
 
     double const ms = outer.stop();
 
