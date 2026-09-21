@@ -59,6 +59,27 @@ double solve(
     std::size_t const k,
     std::size_t  *n_iterations);
 
+/*  Phase-separated timing, milliseconds, accumulated over the last
+    factor/solve pair.
+
+    Collected from CUDA event markers laid at phase boundaries with a single
+    synchronization at the end, NOT a sync per phase: the latter serializes
+    the stream and inflates exactly the overlap being measured. The vendored
+    RECONPROF=1 path does sync per launch and reports summed kernel duration
+    — a different quantity, useful for slice-vs-trailing inside the factor,
+    and not comparable with these. */
+struct phase_times {
+    double prepare  = 0.;   /* transpose + DF32 split of A           */
+    double factor   = 0.;   /* int8lu_factor                         */
+    double perm     = 0.;   /* compose interchanges, host round trip */
+    double residual = 0.;   /* r = b - A x, DF32                     */
+    double gather   = 0.;   /* P r                                   */
+    double trsv     = 0.;   /* both triangular solves                */
+    double update   = 0.;   /* split, correction, combine, norms     */
+};
+
+phase_times const &profile(state const *s);
+
 /*  Copy the factored carrier and the composed permutation to the host, for
     an out-of-band reconstruction check. Row major, n*n each. */
 void copy_factor(

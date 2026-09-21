@@ -123,6 +123,44 @@ struct state {
 
     std::vector<void *> owned;
 
+    /*  Phase markers. One event per boundary, synchronized once at the end,
+        so the breakdown costs a record per phase and no serialization. */
+    std::vector<cudaEvent_t> marks;
+    std::size_t              n_marks = 0;
+    phase_times              times   = {};
+
+    /*  Phase each span ENDS in; -1 opens the sequence. Tagging rather than
+        assuming a fixed stride per iteration, because the loop can exit at
+        the convergence test with only part of an iteration recorded. */
+    std::vector<int> tags;
+
+    cudaEvent_t mark(int const phase) {
+        if (n_marks < tags.size()) tags[n_marks] = phase;
+        else                       tags.push_back(phase);
+        if (n_marks == marks.size()) {
+            cudaEvent_t e = nullptr;
+            CUDA_CHECK(cudaEventCreate(&e));
+            marks.push_back(e);
+        }
+        cudaEvent_t const e = marks[n_marks++];
+        CUDA_CHECK(cudaEventRecord(e));
+        return e;
+    }
+
+    /*  Sum the spans by tag. Call after a synchronization. */
+    void fold(double *bucket[]) {
+        for (std::size_t i = 1; i != n_marks; ++i)
+            if (tags[i] >= 0)
+                *bucket[tags[i]] += span(i - 1, i);
+        n_marks = 0;
+    }
+
+    double span(std::size_t const a, std::size_t const b) const {
+        float ms = 0.f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, marks[a], marks[b]));
+        return static_cast<double>(ms);
+    }
+
     void *acquire(std::size_t const bytes) {
         void *p = nullptr;
         if (!CUDA_CHECK(cudaMalloc(&p, bytes)))
@@ -173,6 +211,9 @@ void destroy(state *s) {
     if (s == nullptr)
         return;
 
+    for (std::size_t i = 0; i != s->marks.size(); ++i)
+        CUDA_CHECK(cudaEventDestroy(s->marks[i]));
+
     int8lu_scratch_free(s->scratch);
     for (std::size_t i = 0; i != s->owned.size(); ++i)
         CUDA_CHECK(cudaFree(s->owned[i]));
@@ -194,11 +235,20 @@ void prepare(
     /*  One transpose+split into the residual operator, then a straight copy
         into the carrier: the two hold the same matrix and only the carrier
         is destroyed. */
+    s->times = phase_times();
+    s->n_marks = 0;
+    s->mark(-1);
+
     convert::transpose_split_df32(s->d_ah, s->d_al, d_a, s->n);
     CUDA_CHECK(cudaMemcpy(s->d_hi, s->d_ah, nn * sizeof(float),
                           cudaMemcpyDeviceToDevice));
     CUDA_CHECK(cudaMemcpy(s->d_lo, s->d_al, nn * sizeof(float),
                           cudaMemcpyDeviceToDevice));
+
+    s->mark(0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    s->times.prepare += s->span(0, 1);
+    s->n_marks = 0;
 }
 
 double factor(state *s) {
@@ -213,6 +263,8 @@ double factor(state *s) {
                   UPD_INT8, s->d_hi, s->d_lo, s->d_piv, s->scratch);
 
     double const ms = watch.stop();
+    s->times.factor += ms;
+    double const t_perm0 = ms;
 
     /*  Compose the sequential interchanges into a permutation. Serial by
         nature and n ints against an O(n^3) factorization, so the host does
@@ -231,6 +283,10 @@ double factor(state *s) {
     }
     CUDA_CHECK(cudaMemcpy(s->d_perm, perm.data(), n * sizeof(int),
                           cudaMemcpyHostToDevice));
+
+    /*  The compose is host-serial between two blocking copies, so the
+        stopwatch's device timeline measures it fairly. */
+    s->times.perm += watch.stop() - t_perm0;
 
     return ms;
 }
@@ -251,6 +307,9 @@ double solve(
     std::size_t used = 0;
 
     CUDA_CHECK(cudaDeviceSynchronize());
+    s->n_marks = 0;
+    s->mark(-1);
+
     timing::stopwatch outer;
     outer.start();
 
@@ -271,6 +330,7 @@ double solve(
                           cudaMemcpyDeviceToHost));
     if (b_norm <= 0.f)
         b_norm = 1.f;
+    s->mark(3);
 
     /*  A cap, not a schedule: the loop stops on its own test and reports the
         count it used. */
@@ -291,6 +351,10 @@ double solve(
         CUDA_CHECK(cudaMemcpy(&r_norm, s->d_nrm, sizeof(float),
                               cudaMemcpyDeviceToHost));
 
+        /*  The reduction belongs to the residual: it is what the residual
+            is for, and its D2H is the sync the loop already pays. */
+        s->mark(0);
+
         double const rel = static_cast<double>(r_norm) /
                            static_cast<double>(b_norm);
         if (rel < 1e-14)
@@ -308,16 +372,22 @@ double solve(
 
         LAUNCH((gather_kernel<<<g, T>>>(n, s->d_perm, s->d_rh, s->d_rl,
                                         s->d_yh, s->d_yl)));
+        s->mark(1);
+
         trsv_L_blocked(n, 256, s->d_hi, s->d_lo, s->d_yh, s->d_yl,
                        s->d_zh, s->d_zl, s->d_th, s->d_tl);
         trsv_U_blocked(n, 256, s->d_hi, s->d_lo, s->d_zh, s->d_zl,
                        s->d_yh, s->d_yl, s->d_th, s->d_tl);
+        s->mark(2);
+
         LAUNCH((add_correction_kernel<<<g, T>>>(n, s->d_yh, s->d_yl,
                                                 s->d_xh, s->d_xl)));
+        s->mark(3);
         ++it_col;
     }
 
     LAUNCH((combine_kernel<<<g, T>>>(n, s->d_xh, s->d_xl, d_xc)));
+    s->mark(3);
 
     /*  Max over columns, not the last: a column that needed more passes is
         itself worth seeing. */
@@ -327,10 +397,20 @@ double solve(
 
     double const ms = outer.stop();
 
+    double *bucket[4] = {&s->times.residual, &s->times.gather,
+                         &s->times.trsv,     &s->times.update};
+    s->fold(bucket);
+
     if (n_iterations != nullptr)
         *n_iterations = used;
 
     return ms;
+}
+
+phase_times const &profile(state const *s) {
+
+    static phase_times const empty = {};
+    return (s != nullptr)? s->times : empty;
 }
 
 void copy_factor(
