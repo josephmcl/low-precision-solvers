@@ -104,6 +104,12 @@ struct state {
     int            kfac    = 0;
     kernel         which   = kernel::sliced;
     oii::state    *oii_s   = nullptr;
+
+    /*  S-rung diagonal-block inverses, n*IB floats each, built once per
+        factorization. Null when srung_ib is 0. */
+    int    srung_ib = 0;
+    float *d_dlh = nullptr, *d_dll = nullptr;
+    float *d_duh = nullptr, *d_dul = nullptr;
     cublasHandle_t blas    = nullptr;
     Int8LUScratch  scratch = {};
 
@@ -177,13 +183,21 @@ state *create(
     std::size_t const n,
     int const         b,
     int const         kfac,
-    kernel const      which) {
+    kernel const      which,
+    int const         srung_ib) {
+
+    if (srung_ib != 0 && (srung_ib <= 0 || n % srung_ib != 0)) {
+        std::fprintf(stderr, "[int8lu] srung_ib=%d does not divide n=%zu\n",
+                     srung_ib, n);
+        return nullptr;
+    }
 
     state *s = new state;
-    s->n     = n;
-    s->b     = b;
-    s->kfac  = kfac;
-    s->which = which;
+    s->n        = n;
+    s->b        = b;
+    s->kfac     = kfac;
+    s->which    = which;
+    s->srung_ib = srung_ib;
 
     if (!CUBLAS_CHECK(cublasCreate(&s->blas))) {
         delete s;
@@ -206,6 +220,19 @@ state *create(
         *work[i] = static_cast<float *>(s->acquire(n * sizeof(float)));
 
     s->d_nrm = static_cast<float *>(s->acquire(sizeof(float)));
+
+    if (srung_ib != 0) {
+        std::size_t const nb = n * static_cast<std::size_t>(srung_ib)
+                             * sizeof(float);
+        s->d_dlh = static_cast<float *>(s->acquire(nb));
+        s->d_dll = static_cast<float *>(s->acquire(nb));
+        s->d_duh = static_cast<float *>(s->acquire(nb));
+        s->d_dul = static_cast<float *>(s->acquire(nb));
+        if (s->d_dul == nullptr) {
+            destroy(s);
+            return nullptr;
+        }
+    }
 
     int8lu_scratch_alloc(s->scratch, static_cast<int>(n), b, kfac);
 
@@ -351,6 +378,15 @@ double factor(state *s) {
                       UPD_INT8, s->d_hi, s->d_lo, s->d_piv, s->scratch);
     }
 
+    /*  The inverses depend only on the factor, so they are built here and
+        reused by every refinement step of every right-hand side. Timed
+        with the factorization because that is where the work is: charging
+        them to the solve would flatter it. */
+    if (s->srung_ib != 0)
+        srung_invert(static_cast<int>(s->n), s->srung_ib,
+                     s->d_hi, s->d_lo,
+                     s->d_dlh, s->d_dll, s->d_duh, s->d_dul);
+
     double const ms = watch.stop();
     s->times.factor += ms;
     double const t_perm0 = ms;
@@ -463,10 +499,19 @@ double solve(
                                         s->d_yh, s->d_yl)));
         s->mark(1);
 
-        trsv_L_blocked(n, 256, s->d_hi, s->d_lo, s->d_yh, s->d_yl,
-                       s->d_zh, s->d_zl, s->d_th, s->d_tl);
-        trsv_U_blocked(n, 256, s->d_hi, s->d_lo, s->d_zh, s->d_zl,
-                       s->d_yh, s->d_yl, s->d_th, s->d_tl);
+        if (s->srung_ib != 0) {
+            trsv_L_blocked_inv(n, 256, s->srung_ib, s->d_hi, s->d_lo,
+                               s->d_dlh, s->d_dll, s->d_yh, s->d_yl,
+                               s->d_zh, s->d_zl, s->d_th, s->d_tl);
+            trsv_U_blocked_inv(n, 256, s->srung_ib, s->d_hi, s->d_lo,
+                               s->d_duh, s->d_dul, s->d_zh, s->d_zl,
+                               s->d_yh, s->d_yl, s->d_th, s->d_tl);
+        } else {
+            trsv_L_blocked(n, 256, s->d_hi, s->d_lo, s->d_yh, s->d_yl,
+                           s->d_zh, s->d_zl, s->d_th, s->d_tl);
+            trsv_U_blocked(n, 256, s->d_hi, s->d_lo, s->d_zh, s->d_zl,
+                           s->d_yh, s->d_yl, s->d_th, s->d_tl);
+        }
         s->mark(2);
 
         LAUNCH((add_correction_kernel<<<g, T>>>(n, s->d_yh, s->d_yl,

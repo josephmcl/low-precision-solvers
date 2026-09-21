@@ -41,14 +41,29 @@ enum class kernel { sliced, oii };
     operator the refinement needs cannot be the same array. */
 constexpr double STORAGE_N2 = 16.;
 
-/*  Allocate for an n x n solve at panel width b (256 is the tuned value)
-    and depth `kfac` -- the slice count k for the sliced kernel, the
-    modulus count N for oii. Returns null on failure. */
+/*  S-rung: invert the IB x IB diagonal sub-blocks once per factorization
+    and turn each 256-deep forward substitution into 256/IB GEMV applies.
+
+    The vendored measurement is -68% on the solve, and the phase table for
+    this arm puts the diagonal TRSV at 43.5% of everything at n = 8192, so
+    it is the largest single lever available here.
+
+    It is NOT bit-identical. Upstream classes it a reorder-clause change
+    whose gates are the iteration count and the backward error, because
+    refinement self-corrects the reordering. `srung_ib` is the knob: 0
+    disables it, 16 keeps the inverse bounded by 2^16 and is safe in DF32,
+    and 256 inverts the whole diagonal block for the largest win at the
+    cost of an inverse that grows with the block's conditioning. n must be
+    a multiple of it.
+
+    Anything quoted from a run with this on must say so; it is a different
+    solve, not a faster spelling of the same one. */
 state *create(
     std::size_t const n,
     int const         b,
     int const         kfac,
-    kernel const      which = kernel::sliced);
+    kernel const      which = kernel::sliced,
+    int const         srung_ib = 0);
 
 void destroy(state *s);
 
