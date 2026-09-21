@@ -78,6 +78,7 @@ COMMON    := \
 	$(COM_OBJ)/tuning.o      \
 	$(COM_OBJ)/problem.o     \
 	$(COM_OBJ)/metrics.o     \
+	$(COM_OBJ)/exact_crt.o   \
 	$(COM_OBJ)/ozaki2.o      \
 	$(COM_OBJ)/ozaki.o       \
 	$(COM_OBJ)/trsm.o        \
@@ -102,6 +103,7 @@ ENERGY_MAIN := $(POBJ_DIR)/main_energy.o
 KCHECK_MAIN := $(POBJ_DIR)/main_kappacheck.o
 DDCHECK_MAIN:= $(TOBJ_DIR)/main_ddcheck.o
 I8PROBE_MAIN:= $(TOBJ_DIR)/main_int8lu_probe.o
+EXCRT_MAIN  := $(TOBJ_DIR)/main_exact_crt.o
 OIICRT_MAIN := $(TOBJ_DIR)/main_oii_crt.o
 # panel_persist.cu is a cooperative-launch TU and must stay relocatable
 # (-dc); int8lu_factor references its launcher unconditionally, so it links
@@ -114,7 +116,7 @@ all: $(BIN_DIR)/lps-sweep $(BIN_DIR)/lps-probe $(BIN_DIR)/lps-ozaki-test \
      $(BIN_DIR)/lps-rcheck $(BIN_DIR)/lps-profile \
      $(BIN_DIR)/lps-oom $(BIN_DIR)/lps-energy \
      $(BIN_DIR)/lps-kappacheck $(BIN_DIR)/lps-ddcheck \
-     $(BIN_DIR)/lps-int8lu-probe $(BIN_DIR)/lps-oii-crt
+     $(BIN_DIR)/lps-int8lu-probe $(BIN_DIR)/lps-exact-crt $(BIN_DIR)/lps-oii-crt
 
 $(BIN_DIR)/lps-sweep: $(COMMON) $(SWEEP_MAIN) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
@@ -148,7 +150,10 @@ $(OBJ_DIR)/panel_persist.o: $(VENDOR_DIR)/panel_persist.cu | $(OBJ_DIR)
 $(BIN_DIR)/lps-int8lu-probe: $(COMMON) $(COM_OBJ)/reference.o $(I8PROBE_MAIN) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
 
-$(BIN_DIR)/lps-oii-crt: $(COM_OBJ)/ozaki2.o $(COM_OBJ)/error.o $(COM_OBJ)/definitions.o $(OIICRT_MAIN) | $(BIN_DIR)
+$(BIN_DIR)/lps-oii-crt: $(COM_OBJ)/ozaki2.o $(OIICRT_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcudart
+
+$(BIN_DIR)/lps-exact-crt: $(COM_OBJ)/exact_crt.o $(COM_OBJ)/error.o $(COM_OBJ)/definitions.o $(EXCRT_MAIN) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ -lcudart
 
 # Host-only; does not link COMMON so it runs on a box with no GPU.

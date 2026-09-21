@@ -1,161 +1,90 @@
 #pragma once
 
-#include <cstddef>
+#include <cmath>
 #include <cstdint>
 
-#include "df32.cuh"
+/*  Ozaki-II, accurate mode: arXiv:2602.02549 Algorithms 1-3.
 
-/*  Ozaki-II: exact integer products through pairwise-coprime moduli.
+    Ported to match the campaign's oracle, core_exp/ozaki2.py in the
+    simulation repo, which is faithful to the source. Fidelity is the point
+    rather than elegance: Theorem 2 bounds ALGORITHM 3, whose reduction runs
+    in fp64 against double-double constants, and its R_64 term IS that path's
+    rounding error. Reconstructing exactly instead computes a different and
+    better object, and the envelope test then passes vacuously. An exact
+    variant is kept, clearly labelled, in exact_crt.h.
 
     Where the sliced scheme splits each operand into k int8 pieces and pays
-    k(k+1)/2 products, this represents the product modulo N small primes and
-    pays N. Each residue GEMM is int8 in, int32 accumulate, exact; the true
-    product is recovered from the residues by CRT provided it fits in
-    P = prod p_r.
+    k(k+1)/2 products, this reduces the operands modulo N pairwise-coprime
+    moduli and pays N. Each residue product is exact in int32.
 
-    Reconstruction is where fp64 does or does not enter, so it exists in two
-    LABELLED configurations and they must never be conflated:
-
-      crt_fp64  — accuracy reference. Uses fp64. NOT fp64-free.
-      crt_df32  — the fp64-free combine. The SASS gate applies to this one.
-
-    Garner's mixed-radix form is used rather than the textbook
-    sum r_i M_i y_i mod P, because its digits are all < p_r and stay in int32:
-    the entire modular part is exact integer arithmetic, and floating point
-    appears only in the final weighted sum. That is what makes a fp64-free
-    variant possible at all.
-
-    RANGE. With the eight primes below and N = 8, log2(P) ~ 63.0, so the
-    reconstruction is valid for |x| < P/2 and the fp64 combine cannot be
-    exact there — 63 bits does not fit in 53. At N <= 5 it does. See
-    .claude/ozaki2-crt.md. */
+    Matched operating points against the sliced arm, from the campaign's
+    phase9 data, paired on DELIVERED ACCURACY rather than cost or bits:
+    (k=1, N=3), (k=2, N=5), (k=4, N=8). */
 
 namespace ozaki2 {
 
 constexpr int MAX_MODULI = 8;
 
-/*  Primes just below 256, descending. Prime so pairwise coprime by
-    construction; below 256 so a residue is a uint8 and feeds the int8 path
-    directly. */
+/*  The source's list, largest first. Pairwise coprime but NOT prime —
+    256 = 2^8 fills a uint8 exactly, and the source notes that the int32
+    wrap it can cause is harmless because 2^31 = -2^31 (mod 256). */
 constexpr std::int32_t MODULI[MAX_MODULI] =
-    {251, 241, 239, 233, 229, 227, 223, 211};
+    {256, 255, 253, 251, 247, 241, 239, 233};
 
-/*  log2(prod of the first n_moduli). N=3: 23.8, N=5: 39.5, N=8: 63.0. */
-double product_bits(int const n_moduli);
-
-/*  Inverses needed by Garner: table[j][i] = p_j^-1 mod p_i, for j < i.
-    Filled once on the host, then read by the combine. */
-struct garner_table {
-    std::int32_t inverse[MAX_MODULI][MAX_MODULI] = {};
-    std::int32_t p[MAX_MODULI]                   = {};
-    /*  Mixed-radix digits of floor(P/2), the sign threshold. Held as digits
-        so the comparison is exact integer work — see garner_signed. */
-    std::int32_t half_digit[MAX_MODULI]          = {};
-    int          n_moduli                        = 0;
+/*  Section 3.1. P1 + P2 ~ P and s_l1 + s_l2 ~ (P/p_l) q_l are double-double
+    because neither fits an fp64 word: at N = 8, log2(P) = 64 and P2 = 256
+    exactly. At N <= 5 both corrections are zero and the pairs are inert —
+    the dd machinery only earns its place at the top of the range. */
+struct crt_constants {
+    std::int32_t p[MAX_MODULI]  = {};
+    double       s1[MAX_MODULI] = {};
+    double       s2[MAX_MODULI] = {};
+    double       P1             = 0.;
+    double       P2             = 0.;
+    double       Pinv           = 0.;
+    long long    rho            = 0;
+    int          n_moduli       = 0;
 };
 
-garner_table make_garner_table(int const n_moduli);
+crt_constants make_crt_constants(int const n_moduli);
 
-/*  Mixed-radix digits of the value whose residues are `residue`.
+/*  log2(prod of the first n_moduli): 24.0 at N=3, 40.0 at N=5, 64.0 at N=8. */
+double product_bits(int const n_moduli);
 
-    Exact: every intermediate is reduced mod p_i < 251, so products stay
-    under 251^2 and int32 holds them without rounding. No floating point
-    here, in either configuration. */
-__host__ __device__ inline void garner_digits(
-    std::int32_t const *residue,
-    garner_table const &t,
-    std::int32_t       *digit) {
+/*  The source's symmetric range, -floor(p/2) <= r <= floor(p/2). Not the
+    non-negative representative: the residue products are signed and the
+    envelope is stated against this convention. */
+__host__ __device__ inline std::int64_t sym_mod(
+    std::int64_t const x,
+    std::int32_t const p) {
 
-    for (int i = 0; i != t.n_moduli; ++i) {
-
-        std::int32_t const p = t.p[i];
-        std::int32_t x = residue[i] % p;
-
-        for (int j = 0; j != i; ++j) {
-            x = (x - digit[j]) % p;
-            if (x < 0)
-                x += p;
-            x = (x * t.inverse[j][i]) % p;
-        }
-        digit[i] = x;
-    }
+    std::int64_t r = x % p;
+    if (r < 0)
+        r += p;
+    return (r > p / 2)? r - p : r;
 }
 
-/*  Digits of |x| and its sign, decided ENTIRELY in integer arithmetic.
+/*  Algorithm 3, lines 9-12, for one output element.
 
-    The obvious alternative — combine the unsigned value in [0, P) and
-    subtract P when it exceeds P/2 — is catastrophic and was measured so. A
-    small negative reconstructs as P - |x|, which needs log2(P) bits; at
-    N = 8 that is 63, so fp64 rounds it by ~P*2^-53 ~ 768 and the subtraction
-    cancels everything but the rounding. Observed: relative error 1.0e3 on a
-    true value of 1. No float representation narrower than log2(P) escapes
-    it, which includes both configurations here.
+    w[l] is sym_mod(sum_k A_l[i,k] B_l[k,j], p_l) — the residue product,
+    exact in int32, carried here as a double.
 
-    So the sign is settled by comparing mixed-radix digit vectors against
-    floor(P/2) from the top down, and a negative value is re-derived from the
-    complement residues (p_i - r_i) mod p_i, whose Garner digits are those of
-    |x| directly. The combine then only ever sees a number of the true
-    magnitude, and relative accuracy survives. */
-__host__ __device__ inline bool garner_signed(
-    std::int32_t const *residue,
-    garner_table const &t,
-    std::int32_t       *digit) {
-
-    garner_digits(residue, t, digit);
-
-    bool negative = false;
-    for (int i = t.n_moduli - 1; i >= 0; --i) {
-        if (digit[i] != t.half_digit[i]) {
-            negative = digit[i] > t.half_digit[i];
-            break;
-        }
-    }
-    if (!negative)
-        return false;
-
-    std::int32_t complement[MAX_MODULI];
-    for (int i = 0; i != t.n_moduli; ++i) {
-        std::int32_t const p = t.p[i];
-        complement[i] = (p - residue[i] % p) % p;
-    }
-    garner_digits(complement, t, digit);
-    return true;
-}
-
-/*  Horner over the mixed radix: |x| = d0 + p0 (d1 + p1 (d2 + ...)).
-
-    Evaluated innermost first, so the magnitude grows monotonically and each
-    rounding is relative to the running value — total relative error ~N u. */
+    The two fmas are the source's, and they are load-bearing: the reduction
+    subtracts Q P from a value of the same magnitude, so without the exact
+    products the cancellation would take the answer with it. */
 __host__ __device__ inline double crt_fp64(
-    std::int32_t const *digit,
-    garner_table const &t,
-    bool const          negative) {
+    double const         *w,
+    crt_constants const  &c) {
 
-    double x = 0.;
-    for (int i = t.n_moduli - 1; i >= 0; --i)
-        x = x * static_cast<double>(t.p[i]) + static_cast<double>(digit[i]);
-
-    return negative? -x : x;
-}
-
-/*  The same sum in double-float32. No fp64 instruction: the digits are
-    int32, the radices are small integers exact in fp32, and every add and
-    multiply is an error-free transformation on fp32 words.
-
-    df_mul drops the lo*lo term, which is O(u_ff^2) relative and far below
-    the floor this is reporting. */
-__device__ inline df32 crt_df32(
-    std::int32_t const *digit,
-    garner_table const &t,
-    bool const          negative) {
-
-    df32 x = df_make(0.f, 0.f);
-    for (int i = t.n_moduli - 1; i >= 0; --i) {
-        x = df_mul(x, df_make(static_cast<float>(t.p[i]), 0.f));
-        x = df_add(x, df_make(static_cast<float>(digit[i]), 0.f));
+    double c1 = 0., c2 = 0.;
+    for (int l = 0; l != c.n_moduli; ++l) {
+        c1 += c.s1[l] * w[l];
+        c2 += c.s2[l] * w[l];
     }
 
-    return negative? df_make(-x.hi, -x.lo) : x;
+    double const q     = rint(c1 * c.Pinv);
+    double const inner = fma(-q, c.P1, c1);
+    return fma(-q, c.P2, inner + c2);
 }
 
 } /* namespace ozaki2 */
