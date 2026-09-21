@@ -1,6 +1,7 @@
 #include "common/ozaki2.h"
 
 #include <cmath>
+#include <limits>
 
 namespace ozaki2 {
 
@@ -132,6 +133,17 @@ crt_constants make_crt_constants(int const n_moduli) {
         split_limbs(hi, c.s1_limb[i], MAX_LIMB);
         split_limbs(v[i] - hi, c.s2_limb[i], MAX_LIMB);
     }
+
+    /*  single_triangle_down: to fp32, toward -infinity. */
+    auto down = [](double const x) {
+        float y = static_cast<float>(x);
+        if (static_cast<double>(y) > x)
+            y = std::nextafter(y, -std::numeric_limits<float>::infinity());
+        return static_cast<double>(y);
+    };
+    constexpr double u32 = 0x1p-24;
+    c.Pprime = down(std::log2(to_double(P - 1)) / 2. - 0.5);
+    c.c_step = down(-0.5 / (1. - 4. * u32));
 
     split_limbs(P, c.P_limb, MAX_LIMB);
     c.Pinv_f   = static_cast<float>(c.Pinv);

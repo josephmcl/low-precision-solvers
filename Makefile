@@ -105,6 +105,9 @@ DDCHECK_MAIN:= $(TOBJ_DIR)/main_ddcheck.o
 I8PROBE_MAIN:= $(TOBJ_DIR)/main_int8lu_probe.o
 EXCRT_MAIN  := $(TOBJ_DIR)/main_exact_crt.o
 OIICRT_MAIN := $(TOBJ_DIR)/main_oii_crt.o
+LIFTD_MAIN  := $(TOBJ_DIR)/main_lift_dump.o
+OIIGEMM_MAIN:= $(TOBJ_DIR)/main_oii_gemm.o
+INSTR_DIR   := build/instrumented
 # panel_persist.cu is a cooperative-launch TU and must stay relocatable
 # (-dc); int8lu_factor references its launcher unconditionally, so it links
 # even when PANELPERSIST is never set.
@@ -116,7 +119,8 @@ all: $(BIN_DIR)/lps-sweep $(BIN_DIR)/lps-probe $(BIN_DIR)/lps-ozaki-test \
      $(BIN_DIR)/lps-rcheck $(BIN_DIR)/lps-profile \
      $(BIN_DIR)/lps-oom $(BIN_DIR)/lps-energy \
      $(BIN_DIR)/lps-kappacheck $(BIN_DIR)/lps-ddcheck \
-     $(BIN_DIR)/lps-int8lu-probe $(BIN_DIR)/lps-exact-crt $(BIN_DIR)/lps-oii-crt
+     $(BIN_DIR)/lps-int8lu-probe $(BIN_DIR)/lps-exact-crt $(BIN_DIR)/lps-oii-crt \
+     $(BIN_DIR)/lps-lift-dump $(BIN_DIR)/lps-oii-gemm
 
 $(BIN_DIR)/lps-sweep: $(COMMON) $(SWEEP_MAIN) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
@@ -148,6 +152,28 @@ $(OBJ_DIR)/panel_persist.o: $(VENDOR_DIR)/panel_persist.cu | $(OBJ_DIR)
 	$(NVCC) $(NVCCFLAGS) $(VENDOR_INC) -dc $< -o $@
 
 $(BIN_DIR)/lps-int8lu-probe: $(COMMON) $(COM_OBJ)/reference.o $(I8PROBE_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
+
+# Export harness. It includes an INSTRUMENTED copy of int8lu.cuh generated
+# from the pristine vendor header, so the import stays byte-identical and the
+# md5 manifest keeps checking. It deliberately does not link the arm: that TU
+# includes the same header, and two includers is a duplicate symbol.
+$(INSTR_DIR)/int8lu_instrumented.cuh: $(VENDOR_DIR)/int8lu.cuh tools/instrument_int8lu.py
+	python3 tools/instrument_int8lu.py $@
+
+$(LIFTD_MAIN): $(TEST_DIR)/main_lift_dump.cu $(INSTR_DIR)/int8lu_instrumented.cuh | $(TOBJ_DIR)
+	$(NVCC) $(NVCCFLAGS) -I$(INSTR_DIR) $(VENDOR_INC) -c $< -o $@
+
+$(BIN_DIR)/lps-lift-dump: $(COM_OBJ)/definitions.o $(COM_OBJ)/error.o \
+                          $(COM_OBJ)/timing.o $(COM_OBJ)/convert.o \
+                          $(COM_OBJ)/problem.o $(COM_OBJ)/tuning.o \
+                          $(VENDOR_OBJ) $(LIFTD_MAIN) \
+                          | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN_DIR)/lps-oii-gemm: $(COM_OBJ)/ozaki2.o $(COM_OBJ)/error.o \
+                         $(COM_OBJ)/definitions.o $(OBJ_DIR)/oii_gemm.o \
+                         $(OIIGEMM_MAIN) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
 
 $(BIN_DIR)/lps-oii-crt: $(COM_OBJ)/ozaki2.o $(OIICRT_MAIN) | $(BIN_DIR)
@@ -188,13 +214,8 @@ GATE_SYMS ?=
 sass-gate:
 	@test -n "$(GATE_BIN)" || { echo "usage: make sass-gate GATE_BIN=<binary> GATE_SYMS='sym ...'"; exit 2; }
 	@test -n "$(GATE_SYMS)" || { echo "sass-gate: no GATE_SYMS given, nothing asserted"; exit 2; }
-	@echo "fp64-leak gate on $(GATE_BIN):"; fail=0; \
-	for s in $(GATE_SYMS); do \
-	  n=$$(cuobjdump -sass -fun $$s $(GATE_BIN) 2>/dev/null | grep -cE '$(FP64_RE)' || true); \
-	  if [ "$$n" != "0" ]; then echo "  FAIL  $$s : $$n fp64 instructions"; fail=1; \
-	  else echo "  ok    $$s : 0"; fi; \
-	done; \
-	if [ $$fail -eq 0 ]; then echo "PASS: named kernels are fp64-free"; else echo "FAIL: fp64 leak"; exit 1; fi
+	@tools/sass_gate.sh $(GATE_BIN) $(GATE_SYMS)
+
 
 clean:
 	rm -rf build $(BIN_DIR)

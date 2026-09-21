@@ -57,6 +57,15 @@ struct crt_constants {
     float P_limb[MAX_LIMB]              = {};
     float Pinv_f                        = 0.f;
     float half_P_f                      = 0.f;
+
+    /*  Algorithm 2's two scalars, both single_triangle_down of an fp64
+        expression and therefore fp32 values carried in fp64 words:
+        P' = log2(P-1)/2 - 0.5, and the step coefficient -0.5/(1-4u32).
+        Directed rounding is load-bearing -- the shifts they produce must
+        never overshoot condition (5) -- so they are computed once on the
+        host and not re-derived per launch. */
+    double Pprime                       = 0.;
+    double c_step                       = 0.;
 };
 
 crt_constants make_crt_constants(int const n_moduli);
