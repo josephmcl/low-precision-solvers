@@ -98,6 +98,45 @@ __global__ void permute_rows_kernel(
     }
 }
 
+/*  Tiled transpose + DF32 split. One block owns a TILE_DIM x TILE_DIM tile:
+    reads stride over the input's fast index (column major, so i), writes
+    stride over the output's (row major, so j), and the shared tile turns
+    what would be a strided access on one side into two coalesced ones.
+    Padded by one to keep the column reads off a single bank. */
+constexpr int TILE_DIM   = 32;
+constexpr int BLOCK_ROWS = 8;
+
+__global__ void transpose_split_kernel(
+    float             *d_hi,
+    float             *d_lo,
+    double const      *d_in,
+    std::size_t const  n) {
+
+    __shared__ double tile[TILE_DIM][TILE_DIM + 1];
+
+    std::size_t const i0 = blockIdx.x * TILE_DIM;
+    std::size_t const j0 = blockIdx.y * TILE_DIM;
+
+    for (int k = 0; k < TILE_DIM; k += BLOCK_ROWS) {
+        std::size_t const i = i0 + threadIdx.x;
+        std::size_t const j = j0 + threadIdx.y + k;
+        if (i < n && j < n)
+            tile[threadIdx.y + k][threadIdx.x] = d_in[i + j * n];
+    }
+    __syncthreads();
+
+    for (int k = 0; k < TILE_DIM; k += BLOCK_ROWS) {
+        std::size_t const i = i0 + threadIdx.y + k;
+        std::size_t const j = j0 + threadIdx.x;
+        if (i < n && j < n) {
+            double const v = tile[threadIdx.x][threadIdx.y + k];
+            float  const h = static_cast<float>(v);
+            d_hi[i * n + j] = h;
+            d_lo[i * n + j] = static_cast<float>(v - static_cast<double>(h));
+        }
+    }
+}
+
 /*  Block-reduced sum of squares. The host sums the block partials, so the
     result does not depend on grid size — a reduction whose answer moves with
     launch geometry cannot be used to compare two runs. */
@@ -275,6 +314,29 @@ void permute_rows_demote(
     permute_rows_kernel<true, float>
         <<<launch::grid_for(n * k), launch::BLOCK_SIZE>>>(
             d_out, d_in, d_perm, n, k);
+    KERNEL_CHECK();
+}
+
+void transpose_split_df32(
+    float             *d_hi,
+    float             *d_lo,
+    double const      *d_in,
+    std::size_t const  n,
+    problem           &prob) {
+
+    (void) prob;
+    transpose_split_df32(d_hi, d_lo, d_in, n);
+}
+
+void transpose_split_df32(
+    float             *d_hi,
+    float             *d_lo,
+    double const      *d_in,
+    std::size_t const  n) {
+
+    unsigned const g = static_cast<unsigned>((n + TILE_DIM - 1) / TILE_DIM);
+    dim3 const grid(g, g), block(TILE_DIM, BLOCK_ROWS);
+    transpose_split_kernel<<<grid, block>>>(d_hi, d_lo, d_in, n);
     KERNEL_CHECK();
 }
 
