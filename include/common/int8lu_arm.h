@@ -1,0 +1,56 @@
+#pragma once
+
+#include <cstddef>
+
+/*  The INT-sliced factorization, vendored from nfp64gmresir and wrapped.
+
+    Blocked right-looking LU with partial pivoting on a DF32 carrier; the
+    trailing update slices L21 per row and U12 per column to `kfac` int8
+    slices, multiplies them exactly in int32 on tensor cores, and folds the
+    result back through a DF32 epilogue. Refinement is LU-IR with a DF32
+    residual, so no fp64 arithmetic appears in the solve.
+
+    EXACTLY ONE translation unit may include the vendor header: it defines
+    __global__ kernels and file-scope mutable state in a header, so a second
+    includer is a duplicate symbol at device link and two disconnected copies
+    of the scratch pointers. That TU is source/gpu/factor_int8lu.cu, which is
+    also compiled -c rather than -dc — see the Makefile. */
+
+namespace int8lu_arm {
+
+struct state;
+
+/*  Resident matrix bytes per n^2: 8 for the captured residual operator plus
+    8 for the factor carrier. The factorization consumes its carrier, so the
+    operator the refinement needs cannot be the same array. */
+constexpr double STORAGE_N2 = 16.;
+
+/*  Allocate for an n x n solve at panel width b (256 is the tuned value) and
+    slice depth kfac. Returns null on failure. */
+state *create(
+    std::size_t const n,
+    int const         b,
+    int const         kfac);
+
+void destroy(state *s);
+
+/*  Capture the residual operator and seed the carrier from a COLUMN-MAJOR
+    fp64 A, as harness::problem holds it. Both are row-major DF32 pairs; the
+    transpose and the split happen here. */
+void prepare(
+    state        *s,
+    double const *d_a);
+
+/*  Factor the carrier in place. Returns elapsed milliseconds, event-timed. */
+double factor(state *s);
+
+/*  LU-IR against the captured operator, to the DF32 floor or the cap.
+    d_b and d_x are fp64 n-vectors in the harness's layout; d_x is written.
+    Returns elapsed milliseconds and reports the iterations used. */
+double solve(
+    state        *s,
+    double       *d_x,
+    double const *d_b,
+    std::size_t  *n_iterations);
+
+} /* namespace int8lu_arm */

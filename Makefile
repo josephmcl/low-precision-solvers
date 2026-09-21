@@ -15,6 +15,17 @@ CUDA_ARCH ?= native
 
 INCLUDE   := -Iinclude
 
+# wgmma and TMA exist only under the arch-specific targets (compute_90a,
+# sm_100a); -arch=sm_90 drops them silently and takes a slower path. The
+# -gencode pair carries the 'a' suffix through both halves. NOTE native
+# resolves to sm_90 on Hopper, not sm_90a, so the wgmma path needs
+# an explicit  make CUDA_ARCH=sm_90a
+ifeq ($(CUDA_ARCH),native)
+ARCH_FLAGS := -arch=native
+else
+ARCH_FLAGS := -gencode arch=compute_$(patsubst sm_%,%,$(CUDA_ARCH)),code=$(CUDA_ARCH)
+endif
+
 # C++17 is the CUDA floor; host flags carry the same warning posture as the
 # rest of the project. New code must compile clean under these.
 # -MMD -MP emit a .d per object listing the headers it used, which is what
@@ -24,9 +35,20 @@ INCLUDE   := -Iinclude
 # wrong offset, i.e. a library call failing with NOT_INITIALIZED in a method
 # that has nothing wrong with it. That cost most of a debugging session.
 NVCCFLAGS := -std=c++17 -O3 $(INCLUDE) \
-             -arch=$(CUDA_ARCH) \
+             $(ARCH_FLAGS) \
              -MMD -MP \
              -Xcompiler -Wall,-Wpedantic
+
+# fast-math reassociates and breaks the error-free transformations (TwoSum,
+# TwoProd) the DF32 carrier and reference.h are built on. It emits no fp64
+# and raises no error, so neither the SASS gate nor the status checks can
+# see it — the build has to refuse.
+FASTMATH := $(strip $(findstring use_fast_math,$(NVCCFLAGS)) \
+                    $(findstring ffast-math,$(NVCCFLAGS)))
+ifneq ($(FASTMATH),)
+$(error refusing to build: '$(FASTMATH)' in NVCCFLAGS breaks the error-free \
+        transformations. --fmad=true is fine; TwoProd pins it with __fmaf_rn.)
+endif
 
 LDLIBS    := -lcublas -lcusolver
 
@@ -67,6 +89,18 @@ PROF_MAIN   := $(POBJ_DIR)/main_profile.o
 OOM_MAIN    := $(POBJ_DIR)/main_oom.o
 ENERGY_MAIN := $(POBJ_DIR)/main_energy.o
 KCHECK_MAIN := $(POBJ_DIR)/main_kappacheck.o
+DDCHECK_MAIN:= $(TOBJ_DIR)/main_ddcheck.o
+I8PROBE_MAIN:= $(TOBJ_DIR)/main_int8lu_probe.o
+INT8LU_OBJ  := $(OBJ_DIR)/factor_int8lu.o
+VENDOR_DIR  := vendor/nfp64gmresir/cuda
+VENDOR_INC  := -I$(VENDOR_DIR)
+# The TMA path (FUSE=5) calls cuTensorMapEncodeTiled, a DRIVER API entry
+# point, so the arm needs -lcuda on top of the runtime libraries.
+INT8LU_LIBS := $(LDLIBS) -lcuda
+# panel_persist.cu is a cooperative-launch TU and must stay relocatable
+# (-dc); int8lu_factor references its launcher unconditionally, so it links
+# even when PANELPERSIST is never set.
+VENDOR_OBJ  := $(OBJ_DIR)/panel_persist.o
 
 .PHONY: all clean
 
@@ -74,7 +108,8 @@ all: $(BIN_DIR)/lps-sweep $(BIN_DIR)/lps-probe $(BIN_DIR)/lps-ozaki-test \
      $(BIN_DIR)/lps-ablate $(BIN_DIR)/lps-kappa \
      $(BIN_DIR)/lps-rcheck $(BIN_DIR)/lps-profile \
      $(BIN_DIR)/lps-oom $(BIN_DIR)/lps-energy \
-     $(BIN_DIR)/lps-kappacheck
+     $(BIN_DIR)/lps-kappacheck $(BIN_DIR)/lps-ddcheck \
+     $(BIN_DIR)/lps-int8lu-probe
 
 $(BIN_DIR)/lps-sweep: $(COMMON) $(SWEEP_MAIN) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
@@ -94,6 +129,24 @@ $(BIN_DIR)/lps-rcheck: $(COMMON) $(RCHECK_MAIN) | $(BIN_DIR)
 $(BIN_DIR)/lps-ozaki-test: $(COMMON) $(OZTEST_MAIN) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
 
+# Whole-program (-c, NOT -dc): the vendored wgmma trailing kernel serializes
+# its mma.async instructions under relocatable device code -- ptxas C7509,
+# "Extern calls in the function". Measured here: the remark appears with -dc
+# and is absent with -c. Upstream compiled one TU per binary and never hit it.
+# This is also the only TU permitted to include int8lu.cuh.
+$(INT8LU_OBJ): $(SRC_DIR)/factor_int8lu.cu | $(OBJ_DIR)
+	$(NVCC) $(NVCCFLAGS) $(VENDOR_INC) -c $< -o $@
+
+$(OBJ_DIR)/panel_persist.o: $(VENDOR_DIR)/panel_persist.cu | $(OBJ_DIR)
+	$(NVCC) $(NVCCFLAGS) $(VENDOR_INC) -dc $< -o $@
+
+$(BIN_DIR)/lps-int8lu-probe: $(COMMON) $(INT8LU_OBJ) $(VENDOR_OBJ) $(I8PROBE_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(INT8LU_LIBS)
+
+# Host-only; does not link COMMON so it runs on a box with no GPU.
+$(BIN_DIR)/lps-ddcheck: $(COM_OBJ)/reference.o $(DDCHECK_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@
+
 $(COM_OBJ)/%.o: $(COM_DIR)/%.cu | $(COM_OBJ)
 	$(NVCC) $(NVCCFLAGS) -dc $< -o $@
 
@@ -108,6 +161,27 @@ $(TOBJ_DIR)/%.o: $(TEST_DIR)/%.cpp | $(TOBJ_DIR)
 
 $(OBJ_DIR) $(COM_OBJ) $(TOBJ_DIR) $(POBJ_DIR) $(BIN_DIR):
 	mkdir -p $@
+
+# Assert named kernels emit zero fp64 SASS. The conversions are in the list
+# too -- F2F.F64 is how fp64 usually re-enters. Name in-path kernels only;
+# out-of-path fp64 (metrics, reference) is legitimate.
+#
+#   make sass-gate GATE_BIN=bin/lps-sweep GATE_SYMS='k_a k_b'
+FP64_RE   := DADD|DMUL|DFMA|DSETP|DMNMX|DMMA|F2F\.F64|F2F\.F32\.F64|F2F\.F64\.F32|D2F|F2D
+GATE_BIN  ?=
+GATE_SYMS ?=
+
+.PHONY: sass-gate
+sass-gate:
+	@test -n "$(GATE_BIN)" || { echo "usage: make sass-gate GATE_BIN=<binary> GATE_SYMS='sym ...'"; exit 2; }
+	@test -n "$(GATE_SYMS)" || { echo "sass-gate: no GATE_SYMS given, nothing asserted"; exit 2; }
+	@echo "fp64-leak gate on $(GATE_BIN):"; fail=0; \
+	for s in $(GATE_SYMS); do \
+	  n=$$(cuobjdump -sass -fun $$s $(GATE_BIN) 2>/dev/null | grep -cE '$(FP64_RE)' || true); \
+	  if [ "$$n" != "0" ]; then echo "  FAIL  $$s : $$n fp64 instructions"; fail=1; \
+	  else echo "  ok    $$s : 0"; fi; \
+	done; \
+	if [ $$fail -eq 0 ]; then echo "PASS: named kernels are fp64-free"; else echo "FAIL: fp64 leak"; exit 1; fi
 
 clean:
 	rm -rf build $(BIN_DIR)

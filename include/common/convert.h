@@ -90,6 +90,23 @@ void permute_rows_demote(
     std::size_t const  k,
     problem           &prob);
 
+/*  Column-major fp64 to row-major DF32: out(i, j) = in(i, j) with the
+    storage order flipped and the value split into a (hi, lo) pair.
+
+    harness::problem holds A column major; the int8lu carrier is row major,
+    so the two layouts meet here. Tiled through shared memory because a naive
+    pass has one side strided by n — at 8n^2 that is a 32x traffic
+    amplification, not a rounding error. d_hi and d_lo are n*n each.
+
+    The split is exact data conversion, not arithmetic: hi = fl32(v) and
+    lo = fl32(v - hi) captures ~48 bits of the fp64 input. */
+void transpose_split_df32(
+    float             *d_hi,
+    float             *d_lo,
+    double const      *d_in,
+    std::size_t const  n,
+    problem           &prob);
+
 /*  Sum of squares of an fp32 array, and of the difference of two fp64 arrays.
     Both are convergence measures rather than metrics, so they return the
     SQUARE of the norm and skip the root: a caller comparing a ratio against a
