@@ -113,6 +113,34 @@ struct phase_times {
 
 phase_times const &profile(state const *s);
 
+/*  Slice-cascade saturation on the FACTORED carrier, measured not
+    modelled: i_sat is the level at which the DF32 accumulator stops
+    changing bits, per row, over the panel's 256-column k-extent -- the
+    extent the trailing update actually slices.
+
+    `out` receives one i_sat per row (n entries) for the segment starting
+    at column `c0`; `g_max`, if given, receives the per-row Gamma reading
+    max_entries (|x^(i)| / |a^(i-1)|) beta^i, whose log_beta is the growth
+    term of the projection i_proj = g_max + log_beta(1/u_c).
+
+    Returns false only if some row's residual underflowed to a zero scale
+    AT OR BEFORE its own last change -- underflow after that is an
+    exhausted residual, which is saturation, not contamination. */
+/*  Check the cascade against the vendored slicer on the real L21 block:
+    returns the number of per-level scales that differ. Zero is the only
+    acceptable answer, since everything the saturation grid reports rests
+    on the replication being faithful. */
+std::size_t saturation_verify(
+    state      *s,
+    int const   depth);
+
+bool saturation(
+    state      *s,
+    int const   c0,
+    int const   max_depth,
+    int        *out,
+    float      *g_max);
+
 /*  Copy the factored carrier and the composed permutation to the host, for
     an out-of-band reconstruction check. Row major, n*n each. */
 void copy_factor(

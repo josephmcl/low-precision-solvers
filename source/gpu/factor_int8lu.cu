@@ -193,9 +193,27 @@ state *create(
         return nullptr;
     }
 
+    /*  CLAMP THE PANEL WIDTH BEFORE ANYTHING ALLOCATES.
+
+        int8lu_scratch_alloc computes `size_t M = (size_t)(n - b)` from
+        two ints. With b > n that is negative, wraps to about 2^64, and
+        the cudaMalloc that follows asks for a nonsense size. Upstream
+        never sees it because int8lu_factor clamps `if(b<=0||b>n) b=n`
+        -- but that clamp is inside the FACTOR, which runs long after
+        the scratch is allocated, so the wrapper has to do it here.
+
+        Found by a boundary test in lps-consistency, which triggered it
+        rather than reporting it: the machine became unreachable during
+        the run. The clamp matches the vendor's own rule so the
+        factorization behaves identically; what changes is that the
+        allocation is sane. */
+    int b_use = b;
+    if (b_use <= 0 || static_cast<std::size_t>(b_use) > n)
+        b_use = static_cast<int>(n);
+
     state *s = new state;
     s->n        = n;
-    s->b        = b;
+    s->b        = b_use;
     s->kfac     = kfac;
     s->which    = which;
     s->srung_ib = srung_ib;
@@ -235,13 +253,25 @@ state *create(
         }
     }
 
-    int8lu_scratch_alloc(s->scratch, static_cast<int>(n), b, kfac);
+    int8lu_scratch_alloc(s->scratch, static_cast<int>(n), b_use, kfac);
 
     if (which == kernel::oii) {
-        /*  Sized for the first trailing update, which is the largest; every
-            later one is smaller and passes its own m and n. */
-        s->oii_s = oii::create(n - static_cast<std::size_t>(b), b,
-                               n - static_cast<std::size_t>(b), kfac);
+        /*  Sized for the first trailing update, which is the largest;
+            every later one is smaller and passes its own m and n.
+
+            n <= b means the whole matrix is one panel and there is no
+            trailing update at all. Guarded because `n - b` is computed
+            in size_t and would wrap to an enormous allocation rather
+            than fail. */
+        if (n <= static_cast<std::size_t>(b_use)) {
+            std::fprintf(stderr, "[int8lu] oii arm needs n > b "
+                                 "(n=%zu b=%d): no trailing update\n",
+                         n, b_use);
+            destroy(s);
+            return nullptr;
+        }
+        s->oii_s = oii::create(n - static_cast<std::size_t>(b_use), b_use,
+                               n - static_cast<std::size_t>(b_use), kfac);
         if (s->oii_s == nullptr) {
             destroy(s);
             return nullptr;
@@ -295,6 +325,149 @@ void prepare(
     CUDA_CHECK(cudaDeviceSynchronize());
     s->times.prepare += s->span(0, 1);
     s->n_marks = 0;
+}
+
+/*  ---- slice-cascade saturation on the production carrier -------------
+
+    i_sat is the level at which the DF32 accumulator stops changing BITS.
+    Not a chi criterion, not a residual threshold: the thing itself.
+
+    This replicates k_slice_rows exactly -- per-row max over |hi|, scale
+    max/127, rintf, clamp to +-127, exact two_prod, and the residual
+    updated with df_sub_acc -- and adds a change detector on the
+    accumulator. Replicating rather than calling it is deliberate: the
+    vendored kernel writes slices and scales and keeps no accumulator,
+    and the numerics here are line-for-line the same.
+
+    The carrier has to govern the WHOLE cascade, residual included. The
+    simulation measured what happens otherwise: with the slicer left in
+    fp64 and only the accumulator widened, i_sat ran past 24 levels
+    against a predicted 17, because the contributions floored at
+    u * rowmax instead of continuing to shrink geometrically. Here the
+    residual is DF32 because the arm's residual is DF32.
+
+    The segment width is the panel's 256-column k-extent, because that is
+    the extent the trailing update actually slices over. Saturation
+    depends on the dynamic range the scale has to cover, so measuring it
+    over a different extent would measure a different quantity. */
+__global__ void k_saturation(
+    int const    n,
+    int const    c0,
+    int const    width,
+    int const    max_depth,
+    float const *ah,
+    float const *al,
+    int         *last_change,
+    int         *uf_level,
+    float       *g_ratio,
+    float       *scale_out) {   /* optional, depth x n */
+
+    /*  Sized for the only launch configuration this kernel has, 256
+        threads; the reductions below read blockDim.x so they stay
+        correct if that changes, but these arrays would not. */
+    __shared__ float rh[256], rl[256], acch[256], accl[256], red[256];
+    __shared__ float gmx[256];
+    __shared__ int   any;
+
+    int const i = blockIdx.x;
+    int const t = threadIdx.x;
+
+    float const v_h = (t < width)? ah[static_cast<std::size_t>(i) * n + c0 + t] : 0.f;
+    float const v_l = (t < width)? al[static_cast<std::size_t>(i) * n + c0 + t] : 0.f;
+    rh[t] = v_h;
+    rl[t] = v_l;
+    acch[t] = 0.f;
+    accl[t] = 0.f;
+    gmx[t]  = -1e30f;
+    int last = 0;
+    int uf   = 0;
+    __syncthreads();
+
+    for (int s = 1; s <= max_depth; ++s) {
+
+        float m = (t < width)? fabsf(rh[t]) : 0.f;
+        red[t] = m;
+        __syncthreads();
+        for (int o = blockDim.x >> 1; o > 0; o >>= 1) {
+            if (t < o)
+                red[t] = fmaxf(red[t], red[t + o]);
+            __syncthreads();
+        }
+
+        float sc = (red[0] > 0.f)? red[0] / 127.f : 1.f;
+        /*  The residual reaches the denormal floor and the scale flushes
+            to zero long before a fixed depth cap is hit; the division
+            would then poison the whole cascade with inf. Guarded, and
+            the fact that it happened is REPORTED rather than swallowed,
+            because a run that underflowed is measuring the exponent
+            range and not the saturation depth. */
+        /*  The residual has reached the denormal floor: there is nothing
+            left to slice, and the division would poison the cascade with
+            inf. Record WHEN it happened per row rather than raising one
+            global flag -- a row whose residual vanished has saturated,
+            and only underflow BEFORE the last change invalidates the
+            measurement. The first version flagged the whole grid on any
+            row underflowing and reported nothing usable. */
+        if (sc == 0.f) {
+            sc = 1.f;
+            if (uf == 0)
+                uf = s;
+        }
+
+        if (t == 0) {
+            any = 0;
+            if (scale_out != nullptr)
+                scale_out[static_cast<std::size_t>(s - 1) * gridDim.x + i]
+                    = sc;
+        }
+        __syncthreads();
+
+        if (t < width) {
+            float q = rintf(rh[t] / sc);
+            q = fminf(fmaxf(q, -127.f), 127.f);
+            df32 const x    = two_prod(sc, q);
+            df32 const prev = df_make(acch[t], accl[t]);
+            df32 const a    = df_add_acc(prev, x);
+            if (a.hi != prev.hi || a.lo != prev.lo)
+                atomicOr(&any, 1);
+
+            /*  The simulation's Gamma reading, kept in LOG space:
+                log_beta(|x^(i)| / |a^(i-1)|) + i, whose maximum over
+                entries is g_max directly. Forming the ratio times
+                beta^i and taking the log afterwards overflows fp32 at
+                i = 16 -- beta^16 is 1e38 -- and reports inf for every
+                cell, which is what the first version did. */
+            float const pv = fabsf(prev.hi + prev.lo);
+            float const xv = fabsf(x.hi + x.lo);
+            if (pv > 0.f && xv > 0.f)
+                gmx[t] = fmaxf(gmx[t],
+                               __logf(xv / pv) / 5.53733f + (float)s);
+
+            acch[t] = a.hi;
+            accl[t] = a.lo;
+            df32 const r = df_sub_acc(df_make(rh[t], rl[t]), x);
+            rh[t] = r.hi;
+            rl[t] = r.lo;
+        }
+        __syncthreads();
+
+        if (any != 0)
+            last = s;
+    }
+
+    /*  Row maxima of the Gamma reading. */
+    __syncthreads();
+    for (int o = blockDim.x >> 1; o > 0; o >>= 1) {
+        if (t < o)
+            gmx[t] = fmaxf(gmx[t], gmx[t + o]);
+        __syncthreads();
+    }
+
+    if (t == 0) {
+        last_change[i] = last;
+        uf_level[i]    = uf;
+        g_ratio[i]     = gmx[0];
+    }
 }
 
 /*  ---- multi-RHS triangular solve -------------------------------------
@@ -668,6 +841,11 @@ bool ensure_rhs(state *s, std::size_t const k) {
     if (k <= s->rhs_cap)
         return true;
 
+    /*  Growing keeps the previous buffers in `owned` until destroy
+        rather than freeing them. Bounded by the number of DISTINCT k a
+        state is asked for, which is one in every current caller; it is
+        retention, not a leak. */
+
     float **const work[] = {&s->d_bh, &s->d_bl, &s->d_xh, &s->d_xl,
                             &s->d_rh, &s->d_rl, &s->d_yh, &s->d_yl,
                             &s->d_zh, &s->d_zl, &s->d_th, &s->d_tl};
@@ -718,6 +896,18 @@ double solve(
         (int)nk, d_b, s->d_bh, s->d_bl)));
     CUDA_CHECK(cudaMemset(s->d_xh, 0, nk * sizeof(float)));
     CUDA_CHECK(cudaMemset(s->d_xl, 0, nk * sizeof(float)));
+
+    /*  The batched pass runs every column, converged ones included, so
+        it reads the correction vector of columns that never had a
+        gather -- a column that meets its test on the first residual is
+        exactly that case, and its slot would otherwise hold whatever
+        cudaMalloc returned. The values are discarded either way, but a
+        NaN read is not free and reading uninitialized memory is not
+        something to leave in on the grounds that the answer survives. */
+    CUDA_CHECK(cudaMemset(s->d_yh, 0, nk * sizeof(float)));
+    CUDA_CHECK(cudaMemset(s->d_yl, 0, nk * sizeof(float)));
+    CUDA_CHECK(cudaMemset(s->d_zh, 0, nk * sizeof(float)));
+    CUDA_CHECK(cudaMemset(s->d_zl, 0, nk * sizeof(float)));
 
     /*  ||b||_inf per column, for each column's relative stopping test. */
     std::vector<float> b_norm(k, 1.f);
@@ -859,6 +1049,121 @@ phase_times const &profile(state const *s) {
 
     static phase_times const empty = {};
     return (s != nullptr)? s->times : empty;
+}
+
+/*  Does the cascade in k_saturation actually reproduce k_slice_rows?
+
+    Everything item 6 reports rests on that replication, and a
+    replication is worth exactly as much as the check that it matches.
+    The per-level SCALE is the signature: it is max|hi| / 127 over the
+    row, and it is determined entirely by the residual cascade, so if
+    every scale agrees bit for bit at every level then the residuals
+    agree at every level and so does everything downstream.
+
+    Compares against the vendored kernel on the real L21 block. Returns
+    the number of differing scales. */
+std::size_t saturation_verify(state *s, int const depth) {
+
+    if (s == nullptr)
+        return 1;
+
+    int const n   = static_cast<int>(s->n);
+    int const b   = (n < 256)? n : 256;
+    int const r0  = b;
+    int const mp  = n - r0;
+    if (mp <= 0)
+        return 1;
+
+    std::int8_t *lq = nullptr;
+    float       *ls = nullptr, *sc = nullptr;
+    int         *d_last = nullptr, *d_uf = nullptr;
+    float       *d_g = nullptr;
+    CUDA_CHECK(cudaMalloc(&lq, static_cast<std::size_t>(depth) * mp * b));
+    CUDA_CHECK(cudaMalloc(&ls, static_cast<std::size_t>(depth) * mp * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&sc, static_cast<std::size_t>(depth) * n * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_last, n * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_uf, n * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_g, n * sizeof(float)));
+
+    /*  The vendored slicer, on exactly the block the trailing update
+        slices: rows [b, n) over columns [0, b). */
+    LAUNCH((k_slice_rows<<<mp, 256>>>(n, r0, 0, mp, b, depth,
+                                      s->d_hi, s->d_lo, lq, ls)));
+
+    k_saturation<<<n, 256>>>(n, 0, b, depth, s->d_hi, s->d_lo,
+                             d_last, d_uf, d_g, sc);
+    KERNEL_CHECK();
+
+    std::vector<float> h_ls(static_cast<std::size_t>(depth) * mp);
+    std::vector<float> h_sc(static_cast<std::size_t>(depth) * n);
+    CUDA_CHECK(cudaMemcpy(h_ls.data(), ls, h_ls.size() * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_sc.data(), sc, h_sc.size() * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+
+    std::size_t bad = 0;
+    for (int lev = 0; lev != depth; ++lev)
+        for (int i = 0; i != mp; ++i) {
+            float const v = h_ls[static_cast<std::size_t>(lev) * mp + i];
+            float const w = h_sc[static_cast<std::size_t>(lev) * n + r0 + i];
+            if (v != w)
+                ++bad;
+        }
+
+    cudaFree(lq); cudaFree(ls); cudaFree(sc);
+    cudaFree(d_last); cudaFree(d_uf); cudaFree(d_g);
+    return bad;
+}
+
+bool saturation(
+    state      *s,
+    int const   c0,
+    int const   max_depth,
+    int        *out,
+    float      *g_max) {
+
+    if (s == nullptr || out == nullptr)
+        return false;
+
+    int const n = static_cast<int>(s->n);
+    int const width = (c0 + 256 <= n)? 256 : (n - c0);
+    if (width <= 0)
+        return false;
+
+    int   *d_last = nullptr, *d_uf = nullptr;
+    float *d_g = nullptr;
+    if (!CUDA_CHECK(cudaMalloc(&d_last, n * sizeof(int))) ||
+        !CUDA_CHECK(cudaMalloc(&d_uf, n * sizeof(int))) ||
+        !CUDA_CHECK(cudaMalloc(&d_g, n * sizeof(float))))
+        return false;
+
+    k_saturation<<<n, 256>>>(n, c0, width, max_depth,
+                             s->d_hi, s->d_lo, d_last, d_uf, d_g, nullptr);
+    KERNEL_CHECK();
+
+    std::vector<int> uf(n);
+    CUDA_CHECK(cudaMemcpy(out, d_last, n * sizeof(int),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(uf.data(), d_uf, n * sizeof(int),
+                          cudaMemcpyDeviceToHost));
+    if (g_max != nullptr)
+        CUDA_CHECK(cudaMemcpy(g_max, d_g, n * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+    cudaFree(d_last);
+    cudaFree(d_uf);
+    cudaFree(d_g);
+
+    /*  i_sat is one past the last level that changed anything. A row is
+        valid unless its residual underflowed at or before that level --
+        underflow afterwards just means an exhausted residual, which IS
+        saturation. */
+    bool clean = true;
+    for (int i = 0; i != n; ++i) {
+        if (uf[i] != 0 && uf[i] <= out[i])
+            clean = false;
+        out[i] += 1;
+    }
+    return clean;
 }
 
 void copy_factor(

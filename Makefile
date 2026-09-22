@@ -109,6 +109,8 @@ OIICRT_MAIN := $(TOBJ_DIR)/main_oii_crt.o
 LIFTD_MAIN  := $(TOBJ_DIR)/main_lift_dump.o
 OIIGEMM_MAIN:= $(TOBJ_DIR)/main_oii_gemm.o
 OIIGUARD_MAIN:= $(TOBJ_DIR)/main_oii_guard.o
+SAT_MAIN    := $(TOBJ_DIR)/main_saturation.o
+CONS_MAIN   := $(TOBJ_DIR)/consistency/main_paths.o
 INSTR_DIR   := build/instrumented
 # panel_persist.cu is a cooperative-launch TU and must stay relocatable
 # (-dc); int8lu_factor references its launcher unconditionally, so it links
@@ -123,7 +125,8 @@ all: $(BIN_DIR)/lps-sweep $(BIN_DIR)/lps-probe $(BIN_DIR)/lps-ozaki-test \
      $(BIN_DIR)/lps-kappacheck $(BIN_DIR)/lps-ddcheck \
      $(BIN_DIR)/lps-int8lu-probe $(BIN_DIR)/lps-exact-crt $(BIN_DIR)/lps-oii-crt \
      $(BIN_DIR)/lps-lift-dump $(BIN_DIR)/lps-oii-gemm \
-     $(BIN_DIR)/lps-oii-guard
+     $(BIN_DIR)/lps-oii-guard $(BIN_DIR)/lps-saturation \
+     $(BIN_DIR)/lps-consistency
 
 $(BIN_DIR)/lps-sweep: $(COMMON) $(SWEEP_MAIN) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
@@ -177,6 +180,19 @@ $(BIN_DIR)/lps-lift-dump: $(COM_OBJ)/definitions.o $(COM_OBJ)/error.o \
 $(BIN_DIR)/lps-oii-gemm: $(COM_OBJ)/ozaki2.o $(COM_OBJ)/error.o \
                          $(COM_OBJ)/definitions.o $(OBJ_DIR)/oii_gemm.o \
                          $(OIIGEMM_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
+
+# Cross-path equivalence tests live in their own directory: they check
+# two code paths against each other rather than against a reference, so
+# they are a different kind of thing from the gates.
+$(TOBJ_DIR)/consistency/%.o: $(TEST_DIR)/consistency/%.cu | $(TOBJ_DIR)
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) -dc $< -o $@
+
+$(BIN_DIR)/lps-consistency: $(COMMON) $(CONS_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN_DIR)/lps-saturation: $(COMMON) $(SAT_MAIN) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
 
 $(BIN_DIR)/lps-oii-guard: $(COM_OBJ)/ozaki2.o $(COM_OBJ)/error.o \
