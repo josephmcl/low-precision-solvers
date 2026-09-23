@@ -1,9 +1,9 @@
 #include "common/solver.h"
 
-#include "common/int8lu_arm.h"
+#include "common/qlu.h"
 
 /*  Registry bridge for the INT-sliced arm. The arm itself lives behind
-    int8lu_arm.h because exactly one translation unit may include the vendor
+    qlu.h because exactly one translation unit may include the vendor
     header; this file only needs the pure interface, so it compiles like any
     other method.
 
@@ -23,8 +23,8 @@ void factor_int8lu(state &st, problem &prob) {
 
     /*  Allocation before the stopwatch: an allocator call inside a timed
         region is charged to the arithmetic, and this one is ~16n^2. */
-    st.arm        = int8lu_arm::create(prob.n, b, kfac);
-    st.storage_n2 = int8lu_arm::STORAGE_N2;
+    st.arm        = qlu::create(prob.n, b, kfac);
+    st.storage_n2 = qlu::STORAGE_N2;
 
     if (st.arm == nullptr) {
         std::cout << "[int8lu] could not allocate for n = " << prob.n << "\n";
@@ -40,8 +40,8 @@ void factor_int8lu(state &st, problem &prob) {
         demote for the other refinement schemes. It is also an artefact of two
         codebases disagreeing about layout rather than of the algorithm, so it
         is worth watching separately if it ever matters. */
-    int8lu_arm::prepare(st.arm, prob.d_a);
-    int8lu_arm::factor(st.arm);
+    qlu::prepare(st.arm, prob.d_a);
+    qlu::factor(st.arm);
 
     st.factor_ms = watch.stop();
 }
@@ -56,7 +56,7 @@ void solve_int8lu(
         return;
 
     std::size_t iterations = 0;
-    st.solve_ms     = int8lu_arm::solve(st.arm, d_x, d_b, prob.k, &iterations);
+    st.solve_ms     = qlu::solve(st.arm, d_x, d_b, prob.k, &iterations);
     st.n_iterations = iterations;
 }
 

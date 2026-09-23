@@ -149,13 +149,37 @@ namespace {
 /*  Set for one call and restored, never left on the handle. prob.solver is
     shared with sgetrf, and factorize.cu sets its own mode there -- a mode left
     behind would silently change an unrelated method's arithmetic. Same
-    discipline as the cublasSetMathMode around lu_solve. */
+    discipline as the cublasSetMathMode around lu_solve.
+
+    BOTH KNOBS ARE REQUIRED, and this is the whole story of why the
+    emulated row read as a no-op for so long. The math mode alone
+    changes nothing on a part with full-rate fp64, because the default
+    strategy is PERFORMANT -- "use emulation when it provides a
+    performance benefit" -- and on such a part it never does, so
+    cuSOLVER silently runs native. EAGER is "use emulation whenever
+    possible", which is what a comparison against emulation actually
+    wants.
+
+    Measured at n = 4096 on an H100 NVL, CUDA 13.2, best of three:
+
+        Dgetrf  default                 15.19 ms
+        Dgetrf  + emu math              15.13     <- no-op
+        Dgetrf  + EAGER only            15.15     <- no-op
+        Dgetrf  + emu math + EAGER      27.13     <- 1.79x, emulating
+
+    identically for Xgetrf, so the legacy API is not the limitation
+    either. Any archived number from this row that predates this fix is
+    native fp64 wearing an emulated label. */
 struct math_mode_guard {
     cusolverDnHandle_t handle;
+    cudaEmulationStrategy_t prev = CUDA_EMULATION_STRATEGY_DEFAULT;
     explicit math_mode_guard(cusolverDnHandle_t h) : handle(h) {
+        cusolverDnGetEmulationStrategy(handle, &prev);
         cusolverDnSetMathMode(handle, CUSOLVER_FP64_EMULATED_FIXEDPOINT_MATH);
+        cusolverDnSetEmulationStrategy(handle, CUDA_EMULATION_STRATEGY_EAGER);
     }
     ~math_mode_guard() {
+        cusolverDnSetEmulationStrategy(handle, prev);
         cusolverDnSetMathMode(handle, CUSOLVER_DEFAULT_MATH);
     }
 };

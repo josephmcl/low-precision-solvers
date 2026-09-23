@@ -41,19 +41,32 @@ inline std::size_t pad4(std::size_t const k) {
     its own shift and that row's product is zero anyway -- but a zero
     COLUMN of B poisons nu[j] for every row, and undefined behaviour that
     currently works is not a property to rely on. */
-int const FLAG_ZERO_LINE = 1;   /* zero row of A or zero column of B     */
-int const FLAG_OVERFLOW  = 2;   /* A' or B' outside int32                */
+/*  Only one way left to fail: the scaled operands leaving the range the
+    source permits them, which is |A'| < 2^53. Zero rows of A and zero
+    columns of B are HANDLED -- see the zero-extension note at gemm(). */
+int const FLAG_OVERFLOW  = 2;   /* A' or B' outside 2^53                 */
 
-/*  The scaled operands measure 31 bits at N = 8, which is int32 with no
-    headroom, so the narrowing is where a condition-(5) violation would
-    first show as a silent wrong answer rather than a large one. */
-__device__ inline int clamp_i32(long long const v, int *flags) {
+/*  The scaled operands are held in int64, not int32.
 
-    if (v > 2147483647LL || v < -2147483648LL) {
+    They measure 31 bits on random operands at N = 8 -- int32 with no
+    headroom -- and an operand whose line maximum is an exact power of
+    two tips them over: B = I at N = 8 gives nu = 31 and B' = 2^31,
+    one past int32, which is what the guard caught. The source's own
+    bound is |A'| < 2^53 and the oracle holds these in fp64, so int32
+    was never the right container; it was the one that happened to fit
+    the cases measured first.
+
+    Only the RESIDUES are int8, and they are unaffected: sym_mod already
+    takes an int64. What this costs is 8 bytes per scaled entry instead
+    of 4, on two m x k and k x n arrays. */
+__device__ inline long long clamp_i53(long long const v, int *flags) {
+
+    long long const lim = 1LL << 53;
+    if (v >= lim || v <= -lim) {
         atomicOr(flags, FLAG_OVERFLOW);
-        return (v > 0)? 2147483647 : -2147483648;
+        return (v > 0)? lim - 1 : -(lim - 1);
     }
-    return static_cast<int>(v);
+    return v;
 }
 
 /*  Algorithm 2 line 3: row maxima of |A|, A row major m x k. One block per
@@ -126,11 +139,12 @@ __global__ void k_prescale_a(
     if (i >= m)
         return;
 
+    /*  lem:zero. A zero row of A contributes an identically zero output
+        row, so it needs no shift and no slices; giving it mup = 0 and
+        abar = 0 propagates exactly that. See the note at gemm(). */
     if (amax[i] == 0.) {
-        if (threadIdx.x == 0) {
+        if (threadIdx.x == 0)
             mup[i] = 0;
-            atomicOr(flags, FLAG_ZERO_LINE);
-        }
         for (int h = threadIdx.x; h < k; h += blockDim.x)
             abar[static_cast<std::size_t>(i) * kp + h] = 0;
         return;
@@ -170,10 +184,8 @@ __global__ void k_prescale_b(
         return;
 
     if (bmax[j] == 0.) {
-        if (threadIdx.x == 0) {
+        if (threadIdx.x == 0)
             nup[j] = 0;
-            atomicOr(flags, FLAG_ZERO_LINE);
-        }
         for (int h = threadIdx.x; h < k; h += blockDim.x)
             bbar[static_cast<std::size_t>(j) * kp + h] = 0;
         return;
@@ -236,12 +248,13 @@ __global__ void k_shifts(
     if (threadIdx.x != 0)
         return;
 
-    /*  A zero maximum means the whole line was zero. log2f(0) is -inf and
-        the int conversion that follows is undefined, so bail with a
-        benign shift and let the caller see the flag. */
+    /*  A zero maximum means the line contributes nothing to the
+        product. log2f(0) is -inf and the int conversion after it is
+        undefined, so the shift is left at the prescale's value; the
+        operand is zero either way and the output line comes out an
+        exact zero. */
     if (!(red[0] > 0.f)) {
         shift[idx] = pre[idx];
-        atomicOr(flags, FLAG_ZERO_LINE);
         return;
     }
 
@@ -260,7 +273,7 @@ __global__ void k_scale_trunc_a(
     int const     kp,
     double const *a,
     int const    *mu,
-    int          *ap,
+    long long    *ap,
     int          *flags) {
 
     int const i = blockIdx.x;
@@ -268,7 +281,7 @@ __global__ void k_scale_trunc_a(
         return;
     double const f = exp2(static_cast<double>(mu[i]));
     for (int h = threadIdx.x; h < k; h += blockDim.x)
-        ap[static_cast<std::size_t>(i) * kp + h] = clamp_i32(
+        ap[static_cast<std::size_t>(i) * kp + h] = clamp_i53(
             static_cast<long long>(
                 trunc(a[static_cast<std::size_t>(i) * k + h] * f)), flags);
 }
@@ -279,7 +292,7 @@ __global__ void k_scale_trunc_b(
     int const     n,
     double const *b,
     int const    *nu,
-    int          *bp,
+    long long    *bp,
     int          *flags) {
 
     int const j = blockIdx.x;
@@ -287,7 +300,7 @@ __global__ void k_scale_trunc_b(
         return;
     double const f = exp2(static_cast<double>(nu[j]));
     for (int h = threadIdx.x; h < k; h += blockDim.x)
-        bp[static_cast<std::size_t>(j) * kp + h] = clamp_i32(
+        bp[static_cast<std::size_t>(j) * kp + h] = clamp_i53(
             static_cast<long long>(
                 trunc(b[static_cast<std::size_t>(h) * n + j] * f)), flags);
 }
@@ -301,15 +314,15 @@ __global__ void k_residues(
     int const        len,
     int const        n_moduli,
     int const       *p,
-    int const       *src,
+    long long const *src,
     signed char     *dst) {
 
     int const t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= len)
         return;
-    int const v = src[t];
+    long long const v = src[t];
     for (int l = 0; l != n_moduli; ++l) {
-        int r = v % p[l];
+        long long r = v % p[l];
         if (r < 0)
             r += p[l];
         if (r > p[l] / 2)
@@ -390,10 +403,16 @@ __global__ void k_crt_unscale(
     differ only when the exact value lies within u_64 of an integer. The
     bitwise gate against the oracle is what says whether it ever happens. */
 
+/*  Exponent of a DF32 pair. EXP_ZERO marks an exactly-zero entry, which
+    has no exponent: returning -126 for it (as the first version did)
+    makes an all-zero line indistinguishable from a line of denormals
+    and defeats the zero-line detection downstream. */
+int const EXP_ZERO = -30000;
+
 __device__ inline int df_ilogb(float const hi, float const lo) {
 
     if (hi == 0.f)
-        return (lo == 0.f)? -126 : ilogbf(lo);
+        return (lo == 0.f)? EXP_ZERO : ilogbf(lo);
     int e = ilogbf(hi);
     float const m = ldexpf(fabsf(hi), -e);          /* in [1, 2) */
     if (m == 1.0f && ((hi > 0.f)? (lo < 0.f) : (lo > 0.f)))
@@ -498,7 +517,7 @@ __global__ void k_ff_prescale_a(
     if (i >= m)
         return;
 
-    int e = -1000;
+    int e = EXP_ZERO;
     for (int h = threadIdx.x; h < k; h += blockDim.x) {
         std::size_t const t = static_cast<std::size_t>(i) * lda + h;
         int const q = df_ilogb(ah[t], al[t]);
@@ -513,11 +532,10 @@ __global__ void k_ff_prescale_a(
         __syncthreads();
     }
 
-    if (red[0] == -1000) {
-        if (threadIdx.x == 0) {
+    /*  lem:zero, as in the fp64 path. */
+    if (red[0] == EXP_ZERO) {
+        if (threadIdx.x == 0)
             mup[i] = 0;
-            atomicOr(flags, FLAG_ZERO_LINE);
-        }
         for (int h = threadIdx.x; h < k; h += blockDim.x)
             abar[static_cast<std::size_t>(i) * kp + h] = 0;
         return;
@@ -549,7 +567,7 @@ __global__ void k_ff_prescale_b(
     if (j >= n)
         return;
 
-    int e = -1000;
+    int e = EXP_ZERO;
     for (int h = threadIdx.x; h < k; h += blockDim.x) {
         std::size_t const t = static_cast<std::size_t>(h) * ldb + j;
         int const q = df_ilogb(bh[t], bl[t]);
@@ -564,11 +582,10 @@ __global__ void k_ff_prescale_b(
         __syncthreads();
     }
 
-    if (red[0] == -1000) {
-        if (threadIdx.x == 0) {
+    /*  lem:zero, as in the fp64 path. */
+    if (red[0] == EXP_ZERO) {
+        if (threadIdx.x == 0)
             nup[j] = 0;
-            atomicOr(flags, FLAG_ZERO_LINE);
-        }
         for (int h = threadIdx.x; h < k; h += blockDim.x)
             bbar[static_cast<std::size_t>(j) * kp + h] = 0;
         return;
@@ -620,7 +637,6 @@ __global__ void k_ff_shifts(
         return;
     if (!(red[0] > 0.f)) {
         shift[idx] = pre[idx];
-        atomicOr(flags, FLAG_ZERO_LINE);
         return;
     }
     shift[idx] = pre[idx] + ff_floor_step(log2f(red[0]), c_step, pprime);
@@ -634,7 +650,7 @@ __global__ void k_ff_scale_trunc_a(
     float const *ah,
     float const *al,
     int const   *mu,
-    int         *ap,
+    long long   *ap,
     int         *flags) {
 
     int const i = blockIdx.x;
@@ -643,7 +659,7 @@ __global__ void k_ff_scale_trunc_a(
     for (int h = threadIdx.x; h < k; h += blockDim.x) {
         std::size_t const t = static_cast<std::size_t>(i) * lda + h;
         ap[static_cast<std::size_t>(i) * kp + h] =
-            clamp_i32(df_trunc_scaled(ah[t], al[t], mu[i]), flags);
+            clamp_i53(df_trunc_scaled(ah[t], al[t], mu[i]), flags);
     }
 }
 
@@ -655,7 +671,7 @@ __global__ void k_ff_scale_trunc_b(
     float const *bh,
     float const *bl,
     int const   *nu,
-    int         *bp,
+    long long   *bp,
     int         *flags) {
 
     int const j = blockIdx.x;
@@ -664,7 +680,7 @@ __global__ void k_ff_scale_trunc_b(
     for (int h = threadIdx.x; h < k; h += blockDim.x) {
         std::size_t const t = static_cast<std::size_t>(h) * ldb + j;
         bp[static_cast<std::size_t>(j) * kp + h] =
-            clamp_i32(df_trunc_scaled(bh[t], bl[t], nu[j]), flags);
+            clamp_i53(df_trunc_scaled(bh[t], bl[t], nu[j]), flags);
     }
 }
 
@@ -735,7 +751,7 @@ struct state {
     int    *dp = nullptr;                 /* the moduli, on the device */
     signed char *abar = nullptr, *bbar = nullptr;
     int    *cbar = nullptr;
-    int    *ap = nullptr, *bp = nullptr;
+    long long *ap = nullptr, *bp = nullptr;
     signed char *ares = nullptr, *bres = nullptr;
     int    *prod = nullptr;
     int    *flags = nullptr;
@@ -788,8 +804,8 @@ state *create(
     /*  Zero once: the pad columns are never written again. */
     CUDA_CHECK(cudaMemset(s->abar, 0, m * s->kp));
     CUDA_CHECK(cudaMemset(s->bbar, 0, s->kp * n));
-    CUDA_CHECK(cudaMemset(s->ap, 0, m * s->kp * sizeof(int)));
-    CUDA_CHECK(cudaMemset(s->bp, 0, s->kp * n * sizeof(int)));
+    CUDA_CHECK(cudaMemset(s->ap, 0, m * s->kp * sizeof(long long)));
+    CUDA_CHECK(cudaMemset(s->bp, 0, s->kp * n * sizeof(long long)));
 
     CUDA_CHECK(cudaMemcpy(s->dp, s->c.p,
                           ozaki2::MAX_MODULI * sizeof(int),
@@ -824,10 +840,6 @@ bool report_flags(state const *s) {
     CUDA_CHECK(cudaMemcpy(&f, s->flags, sizeof f, cudaMemcpyDeviceToHost));
     if (f == 0)
         return true;
-    if (f & FLAG_ZERO_LINE)
-        std::fprintf(stderr, "[oii] zero row of A or zero column of B: "
-                             "Algorithm 2 divides by the line maximum and "
-                             "has no meaning there\n");
     if (f & FLAG_OVERFLOW)
         std::fprintf(stderr, "[oii] scaled operand outside int32: "
                              "condition (5) does not hold for these "
@@ -1016,14 +1028,14 @@ void copy_scaling(state const *s, scaling_view &out) {
     out.nu.resize(s->n);
     out.ap.resize(s->m * s->k);
     out.bp.resize(s->k * s->n);
-    std::vector<int> pa(s->m * s->kp), pb(s->kp * s->n);
+    std::vector<long long> pa(s->m * s->kp), pb(s->kp * s->n);
     CUDA_CHECK(cudaMemcpy(out.mu.data(), s->mu, s->m * sizeof(int),
                           cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(out.nu.data(), s->nu, s->n * sizeof(int),
                           cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(pa.data(), s->ap, pa.size() * sizeof(int),
+    CUDA_CHECK(cudaMemcpy(pa.data(), s->ap, pa.size() * sizeof(long long),
                           cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(pb.data(), s->bp, pb.size() * sizeof(int),
+    CUDA_CHECK(cudaMemcpy(pb.data(), s->bp, pb.size() * sizeof(long long),
                           cudaMemcpyDeviceToHost));
     for (std::size_t i = 0; i != s->m; ++i)
         for (std::size_t h = 0; h != s->k; ++h)

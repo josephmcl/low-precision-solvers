@@ -19,7 +19,7 @@
 
 /*  Incomplete on purpose: the arm's header is pure but there is no reason
     for every method to see it. solver.cu includes it to destroy the state. */
-namespace int8lu_arm { struct state; }
+namespace qlu { struct state; }
 
 namespace solver {
 
@@ -84,7 +84,7 @@ struct state {
 
     /*  INT-sliced arm: opaque, owns its own device memory and the vendored
         scratch, so it is released by destroy() rather than by _d_owned. */
-    int8lu_arm::state *arm = nullptr;
+    qlu::state *arm = nullptr;
 
     /*  fp32 factorization, shared by every refinement scheme. */
     float *d_lu   = nullptr;

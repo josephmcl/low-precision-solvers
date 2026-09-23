@@ -60,10 +60,29 @@ void destroy(state *s);
 /*  C = A B. A is ROW major m x k, B is ROW major k x n, C is written ROW
     major m x n. All fp64 on the device.
 
-    Zero rows of A and zero columns of B are rejected rather than handled:
-    Algorithm 2 divides by the row maximum, so it has no meaning there, and
-    the oracle's zero-extension is a separate construction (`lem:zero`).
-    Returns false if it sees one, or if condition (5) fails. */
+    ZERO LINES (`lem:zero`). Algorithm 2 divides by the line maximum, so
+    it has no meaning on a zero row of A or a zero column of B, and the
+    source's Theorem 2 assumes there are none. The oracle extends it:
+    delete those lines, bound the reduced product, restore the deleted
+    output rows and columns as exact zeros. That is an extension of the
+    published theorem, not an application of it.
+
+    This implements the extension WITHOUT compacting, because it does
+    not need to. A zero row of A yields abar = 0, hence a zero row of
+    Cbar, hence A' = 0 and an output row of exact zeros -- the pipeline
+    already carries it correctly once the shift is prevented from going
+    through log2(0). And the shifts of the SURVIVING lines are
+    identical to the reduced problem's: mu and nu come from per-line
+    maxima, which do not see other lines at all, and the Cbar maxima
+    that set the second stage are maxima over non-negatives, which extra
+    zeros cannot change. So deleting the lines and not deleting them
+    give the same answer on the lines that remain, and the gather,
+    scatter and second set of buffers a compaction would need buy
+    nothing.
+
+    Returns false only if a scaled operand leaves int32, which is where
+    a condition-(5) failure would first show as a silently wrong answer
+    rather than a large one. */
 bool gemm(
     state        *s,
     int const     m,
@@ -89,7 +108,7 @@ bool gemm(
     is already in registers, and writing it out to read it back doubles the
     traffic on the largest array in the factorization.
 
-    Same restrictions as gemm(): no zero row of A, no zero column of B.
+    Same zero-line handling as gemm().
 
     There is no fp64 counterpart to select here. The fp64 configuration
     reads fp64 operands and is reached through gemm(); the two differ in
@@ -114,10 +133,12 @@ bool gemm_df32(
     gate against the oracle, which compares mu and nu and the scaled
     integer operands before it compares any product. */
 struct scaling_view {
-    std::vector<int> mu;      /* m */
-    std::vector<int> nu;      /* n */
-    std::vector<int> ap;      /* m x k, row major   */
-    std::vector<int> bp;      /* k x n, COLUMN major */
+    std::vector<int>       mu;   /* m */
+    std::vector<int>       nu;   /* n */
+    /*  int64: the source bounds these by 2^53, and at N = 8 an operand
+        whose line maximum is an exact power of two reaches 2^31. */
+    std::vector<long long> ap;   /* m x k, row major    */
+    std::vector<long long> bp;   /* k x n, COLUMN major */
 };
 
 void copy_scaling(state const *s, scaling_view &out);
