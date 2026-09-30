@@ -191,6 +191,56 @@ std::size_t saturation_verify(
     quoted from a stochastic run has to say so. */
 enum class rounding { nearest, stochastic };
 
+/*  One application of B_0^-1 = U^-1 L^-1 P through the DF32 triangular
+    solves refinement uses. n-vectors, fp64 in and out; the solve
+    workspace must already be sized, so call after at least one solve.
+
+    With Mv = apply_inverse(A v) - v this gives the REALIZED transfer
+    operator, which is not the same as the one a dumped factor yields --
+    the difference being exactly the DF32 solve. Also the only tractable
+    access to M at large n. */
+void apply_inverse(state *s, double *d_out, double const *d_in);
+
+/*  Diagnostics from the last solve.
+
+    `rho` is the worst column's ||d_{k+1}||/||d_k||, which in exact
+    arithmetic is the power-iteration estimate of rho(M): the divergence
+    guard and the spectral diagnostic are the same quantity.
+
+    `diverged` is set when a column was cut off for two consecutive
+    growing corrections. A caller that reads only the backward error
+    CANNOT tell a converged solve from a diverging one on an
+    ill-conditioned problem -- ||x|| sits in that metric's denominator,
+    so divergence makes it improve. Check this. */
+/*  Force a fixed iteration count on the next solves, suppressing both
+    early exits. 0 restores normal stopping. For measuring stopping
+    efficiency: the step ferr first reaches its floor against the step
+    the rule fires. */
+/*  A2: a per-step observer for the closed-loop policy. Called once per
+    refinement step after the stopping test and before the correction,
+    with the per-column rho estimates, previous correction norms,
+    divergence flags and done flags. It may set *inner_j to change the
+    correction solver from the next step (0 = stationary, j > 0 = GMRES(j))
+    -- cheap and reversible -- or return nonzero to END the solve, which
+    is how it asks for a refactor; the caller then reads
+    last_refactor_requested, refactors deeper, and calls solve again.
+    done[c] is 1 for a converged column and 2 for one the stall rule
+    stopped; the hook is also called on the step where every column has
+    stopped, and a mode change from there puts the stalled columns back
+    to work. With no hook installed, solve is byte-identical to before. */
+#define LPS_HAS_STEP_HOOK 1
+typedef int (*step_hook_fn)(void *ctx, std::size_t it, std::size_t k,
+                            double const *rho_est, double const *d_prev,
+                            char const *diverged, char const *done,
+                            int *inner_j);
+void set_step_hook(step_hook_fn fn, void *ctx);
+bool last_refactor_requested(state const *s);
+
+void set_force_iters(int const n);
+
+double last_rho(state const *s);
+bool   last_diverged(state const *s);
+
 void set_rounding(rounding const r);
 
 /*  Independent SR draws. Within a stream the factorization is
@@ -199,6 +249,39 @@ void set_rounding(rounding const r);
     never by making the rounding stateful, which would invalidate every
     bitwise gate in the project at once. */
 void set_sr_stream(unsigned long long const stream);
+
+/*  Asymmetric slice depth: Lhat21 to kL, Uhat12 to kU, evaluating the
+    pairs {(i,j) : i < kL, j < kU, i + j < max(kL,kU)}. Zero for either
+    restores the symmetric kfac path, which stays bit-identical.
+
+    Only the evaluated pair set changes. Both operands are still sliced
+    to the depth `create` was given, so this does not reduce the cost of
+    generating slices -- it reduces the slice-pair products, which is the
+    quantity the cost argument is made in. `create`'s kfac must be the
+    deeper of the two, since it sizes the buffers; a larger kL or kU is
+    clamped to it rather than silently reallocating. */
+void set_depths(int const kL, int const kU);
+
+/*  The depths and pair count a state was actually built with, after
+    clamping -- the pair count is the per-tile product count. */
+void depths(state const *s, int *kL, int *kU);
+int pair_count(state const *s);
+
+/*  A3: factor with a supplied row-interchange sequence instead of
+    choosing one. `out`/`host_piv` are n ints where entry c is the
+    ABSOLUTE row swapped into column c -- the panel's own convention, so
+    a sequence captured by copy_pivots feeds straight back in. This is
+    NOT copy_factor's `pv`, which is the composed permutation.
+
+    Passing nullptr restores the search. The forced sequence applies to
+    whatever factors next, and only to the default cooperative panel: the
+    CALU, MIX, blockfac and 2-level panel variants choose pivots in their
+    own kernels and ignore it.
+
+    Verification: forcing the sequence a run chose itself must reproduce
+    that run bit for bit. */
+void copy_pivots(state const *s, int *out);
+void set_forced_pivots(state *s, int const *host_piv);
 
 /*  Number of startup indices i_0 = 1..QLU_I0MAX that `saturation`
     reports a Gamma reading for. */
@@ -215,7 +298,8 @@ bool saturation(
     int        *out,
     float      *g_max,
     int        *isat_i0 = nullptr,
-    int const   qmax = 127);
+    int const   qmax = 127,
+    int        *uf_out = nullptr);
 
 /*  Copy the factored carrier and the composed permutation to the host, for
     an out-of-band reconstruction check. Row major, n*n each. */

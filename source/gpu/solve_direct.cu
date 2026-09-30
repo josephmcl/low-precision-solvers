@@ -1,4 +1,5 @@
 #include "common/solver.h"
+#include "common/cusolver_emu.h"
 
 /*  Reference method: fp64 throughout, cusolverDnDgetrf then Dgetrs.
 

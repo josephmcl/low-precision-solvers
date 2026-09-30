@@ -1,5 +1,6 @@
 #include "common/solver.h"
 #include "common/trsm.h"
+#include "common/cusolver_emu.h"
 
 /*  R-IR: store R = PA - LU instead of A. Storage 8n^2.
     (fp32 LU + fp32 R; 6n^2 if R is kept in bf16.)

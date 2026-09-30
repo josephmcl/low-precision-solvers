@@ -1,4 +1,5 @@
 #include "common/ozaki.h"
+#include "common/cusolver_emu.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

@@ -73,6 +73,45 @@ __global__ void add_correction_kernel(
 
 /*  max |v|, as atomicMax on the float bit pattern. Valid because the values
     compared are magnitudes: IEEE ordering is monotonic on non-negatives. */
+/*  Inf-norm of the DF32 operator, one block per row.
+
+    Needed because the refinement's stopping metric was ||r||/||b||,
+    whose floor is u_ff ||A|| ||x|| / ||b|| -- about 2e-3 when
+    ||x|| ~ 1e12. Normalising by ||A|| ||x|| + ||b|| instead puts the
+    floor at u_ff regardless of conditioning, which is the whole point:
+    the metric then measures the backward error rather than the
+    cancellation in its own evaluation. */
+/*  Set by qlu::set_force_iters; read by solve(). */
+static int g_force_iters = 0;
+
+/*  A2: the closed-loop policy observes each refinement step from inside
+    solve() through this hook and may switch the correction solver
+    (stationary <-> GMRES(j)) or end the solve to request a refactor.
+    With no hook installed the loop is byte-identical to before -- the
+    bit-exact gate (bin/lps-solvestep) is what says so. */
+static qlu::step_hook_fn g_step_hook = nullptr;
+static void             *g_step_hook_ctx = nullptr;
+
+__global__ void k_inf_norm_rows(int const n, float const *ah,
+                                float const *al, float *out) {
+    __shared__ float red[256];
+    int const i = blockIdx.x;
+    int const t = threadIdx.x;
+    double acc = 0.;
+    for (int j = t; j < n; j += blockDim.x) {
+        std::size_t const o = static_cast<std::size_t>(i) * n + j;
+        acc += fabs(static_cast<double>(ah[o]) + static_cast<double>(al[o]));
+    }
+    red[t] = static_cast<float>(acc);
+    __syncthreads();
+    for (int o = blockDim.x >> 1; o > 0; o >>= 1) {
+        if (t < o) red[t] += red[t + o];
+        __syncthreads();
+    }
+    if (t == 0) atomicMax(reinterpret_cast<int *>(out),
+                          __float_as_int(red[0]));
+}
+
 __global__ void max_abs_kernel(
     int const    n,
     float const *v,
@@ -135,6 +174,8 @@ struct state {
     float *d_hi = nullptr, *d_lo = nullptr;
 
     int *d_piv  = nullptr;   /* getrf-style interchanges                 */
+    int *d_forced = nullptr; /* A3 forced interchange sequence           */
+    int  last_refactor_requested = 0;   /* A2: hook ended the solve */
     int *d_perm = nullptr;   /* composed permutation, host-built         */
 
     /*  Solve workspace. */
@@ -161,6 +202,9 @@ struct state {
     float *d_zh = nullptr, *d_zl = nullptr;
     float *d_th = nullptr, *d_tl = nullptr;
     float *d_nrm = nullptr;
+    double a_inf  = 0.;    /* ||A||_inf, for a conditioning-free metric */
+    double last_rho = 0.;  /* ||d_{k+1}||/||d_k||, the rho(M) estimate */
+    int    last_diverged = 0;
 
     std::vector<void *> owned;
 
@@ -1462,6 +1506,29 @@ double factor(state *s) {
     if (s == nullptr)
         return 0.;
 
+    /*  The pair set is decided in two places that must agree: the host
+        list (npair/isarr/jsarr, built by int8lu_scratch_alloc at CREATE
+        time from the host mirror) and the device loop (which reads
+        lps_kfacL/lps_kfacU at FACTOR time). Calling set_depths after
+        create leaves them describing different sets, and since the
+        kernels index P by a shared pair counter that is a wrong answer
+        rather than a crash. Cheap to check once per factorization. */
+    {
+        int dL = 0, dU = 0;
+        CUDA_CHECK(cudaMemcpyFromSymbol(&dL, lps_kfacL, sizeof dL));
+        CUDA_CHECK(cudaMemcpyFromSymbol(&dU, lps_kfacU, sizeof dU));
+        int const wantL = (dL > 0)? dL : s->scratch.kfac;
+        int const wantU = (dU > 0)? dU : s->scratch.kfac;
+        if (wantL != s->scratch.kfacL || wantU != s->scratch.kfacU) {
+            std::fprintf(stderr,
+                "[qlu] depth mismatch: this state was built for "
+                "(k_L=%d, k_U=%d) but the device is set to (%d, %d). "
+                "set_depths must be called BEFORE create.\n",
+                s->scratch.kfacL, s->scratch.kfacU, wantL, wantU);
+            return -1.;
+        }
+    }
+
     timing::stopwatch watch;
     watch.start();
 
@@ -1577,6 +1644,9 @@ double solve(
         return 0.;
     if (inner_j > 0 && !ensure_gmres(s, inner_j, k))
         return 0.;
+    /*  The hook may change the correction solver mid-solve. */
+    int inner_j_cur = inner_j;
+    s->last_refactor_requested = 0;
 
     std::size_t const nk = s->n * k;
     std::size_t const ld = s->n;
@@ -1608,6 +1678,15 @@ double solve(
                               cudaMemcpyDeviceToHost));
         b_norm[c] = (v > 0.f)? v : 1.f;
     }
+
+    if (s->a_inf == 0.) {
+        CUDA_CHECK(cudaMemset(s->d_nrm, 0, sizeof(float)));
+        LAUNCH((k_inf_norm_rows<<<n, 256>>>(n, s->d_ah, s->d_al, s->d_nrm)));
+        float av = 0.f;
+        CUDA_CHECK(cudaMemcpy(&av, s->d_nrm, sizeof(float),
+                              cudaMemcpyDeviceToHost));
+        s->a_inf = (av > 0.f)? static_cast<double>(av) : 1.;
+    }
     s->mark(3);
 
     /*  Per-column refinement state. Every column is carried through every
@@ -1615,11 +1694,62 @@ double solve(
         stops taking the correction -- so its answer is what the column
         loop would have produced, bit for bit, and the batching costs it
         only wasted work. */
-    std::size_t const cap = 60;
+    /*  LPS_ITCAP overrides the iteration cap. Needed because the
+        internal stopping metric cannot resolve the answer on
+        ill-conditioned problems: the residual b - Ax is formed in DF32,
+        so its floor is u_ff * ||A|| ||x||, and at kappa = 1e12 with
+        ||x|| ~ 1e12 that is ~2e-3. The 1e-14 tolerance test is then
+        unreachable and the solve always exits on the stall rule. Testing
+        whether a divergent mode surfaces therefore has to be done by
+        running a FIXED number of iterations and measuring the backward
+        error outside, in double-double. */
+    std::size_t cap = 60;
+    if (char const *e = std::getenv("LPS_ITCAP"))
+        cap = static_cast<std::size_t>(std::strtoul(e, nullptr, 10));
+
+    /*  LPS_TRACE=1 prints the backward-error trajectory and suppresses
+        BOTH early exits, so the full cap runs.
+
+        Needed to tell two different claims apart when rho(M) >= 1 and
+        the solve nevertheless reaches tolerance: either the divergent
+        mode is pinned at rounding level and the trajectory stays flat,
+        or the stopping rule fired before the mode surfaced and the
+        trajectory turns back up. Those are not the same result, and the
+        default stopping rule cannot distinguish them. */
+    static int trace_env = -1;
+    if (trace_env < 0) {
+        char const *e = std::getenv("LPS_TRACE");
+        trace_env = (e != nullptr && e[0] == '1')? 1 : 0;
+    }
+    int trace = trace_env;
+
+    /*  Per-call forced iteration count, for measuring STOPPING
+        EFFICIENCY: the step at which ferr first reaches its floor,
+        against the step the rule actually fires. Without that number a
+        stopping-rule change is a replacement rather than a comparison --
+        which is exactly how the A' metric shipped. A global env var
+        cannot do this because the caller needs to sweep it per cell. */
+    if (g_force_iters > 0) {
+        cap = static_cast<std::size_t>(g_force_iters);
+        trace = 1;                  /* suppress both early exits */
+    }
+
+
     std::vector<double>      best(k, 1e30);
     std::vector<int>         stalled(k, 0);
     std::vector<char>        done(k, 0);
     std::vector<std::size_t> it_col(k, 0);
+    /*  Successive correction norms. In exact arithmetic d_{k+1} = -M d_k,
+        so this ratio IS the power-iteration estimate of rho(M) -- the
+        divergence guard and the diagnostic are the same number. On the
+        eig_clustered k=4 kappa=1e12 cell it reads ~1.10 from step 3,
+        which is what the old rule missed entirely while the backward
+        error improved. */
+    std::vector<double>      d_prev(k, 0.);
+    std::vector<double>      rho_est(k, 0.);
+    std::vector<int>         growing(k, 0);
+    std::vector<char>        diverged(k, 0);
+    std::vector<int>         small(k, 0);
 
     for (std::size_t it = 0; it != cap; ++it) {
 
@@ -1642,22 +1772,119 @@ double solve(
             float r_norm = 0.f;
             CUDA_CHECK(cudaMemcpy(&r_norm, s->d_nrm, sizeof(float),
                                   cudaMemcpyDeviceToHost));
-            double const rel = static_cast<double>(r_norm) /
-                               static_cast<double>(b_norm[c]);
-            if (rel < 1e-14) {
-                done[c] = 1;
-                continue;
+            /*  STOPPING IS ON THE CORRECTION NORM, not the residual.
+
+                Both residual normalisations fail, in opposite
+                directions. ||r||/||b|| floors at
+                u_ff ||A|| ||x|| / ||b|| ~ 2e-3 when ||x|| ~ 1e12, so its
+                tolerance never fires and it runs to the stall rule.
+                ||r||/(||A|| ||x|| + ||b||) is a correct backward error
+                and is EXCELLENT immediately -- 8.9e-16 by step 4 -- so
+                it stops while the forward error is still 365x above its
+                floor. Measured on clustered kappa=1e12 b=256: stopping
+                at 4 steps gives ferr 1.98e-02, running to 12 gives
+                7.4e-05 against a floor of 5.4e-05. A backward-error rule
+                cannot drive forward accuracy when kappa is large,
+                because a small backward error does not imply a small
+                forward error -- that is the same fact that made bwd
+                blind to divergence.
+
+                ||d_k|| / ||x_k|| is the standard IR criterion and tracks
+                the forward error directly, since d_k ~ e_k. It is also
+                already computed here for the rho estimate, so the
+                stopping rule, the divergence guard and the spectral
+                diagnostic are one quantity. Lagged by one iteration
+                because the correction is formed after this test. */
+            /*  ||r|| / (||A|| ||x|| + ||b||), reported as the backward
+                error, no longer the stopping test. The denominator's
+                ||A|| ||x|| term is the magnitude the residual evaluation
+                cancels against, so this floors at u_ff rather than at
+                u_ff ||A|| ||x|| / ||b||. */
+            CUDA_CHECK(cudaMemset(s->d_nrm, 0, sizeof(float)));
+            LAUNCH((max_abs_kernel<<<g, T>>>(n, s->d_xh + c * ld,
+                                             s->d_nrm)));
+            float x_n = 0.f;
+            CUDA_CHECK(cudaMemcpy(&x_n, s->d_nrm, sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+            double const den = s->a_inf * static_cast<double>(x_n)
+                             + static_cast<double>(b_norm[c]);
+            double const rel = static_cast<double>(r_norm)
+                             / (den > 0.? den : 1.);
+            if (trace && c == 0)
+                std::printf("[trace] it %2zu  rel %.6e\n", it, rel);
+            /*  The correction-norm test, on the previous iteration's
+                correction. tol = 4 u_ff: below that the correction is
+                at the carrier's own noise level and further steps move
+                nothing. */
+            double const drel = (d_prev[c] > 0. && x_n > 0.f)?
+                                d_prev[c] / static_cast<double>(x_n) : 1.;
+
+            /*  A small correction does not imply a small error.
+                e_k = (I - E) d_k, since d_k = (I+M) e_k and
+                (I+M)^-1 = I - E, so d_k ~ e_k only where E is small
+                ALONG the error direction -- and ||E|| is 6e5 on
+                eig_clustered. In the convergent regime the error aligns
+                with directions where E is small, which is why the rule
+                reproduced the 11-step run there; in marginal cells (rho
+                near 1, s near 0) a small correction can sit beside a
+                much larger error.
+
+                Two guards: accept the stop only when the warmed-up
+                correction ratio is below 1/2, or else require the
+                small-correction condition on two consecutive steps. */
+            bool const warm_ok = (rho_est[c] > 0. && rho_est[c] < 0.5);
+            if (drel < 4. * 0x1p-49)
+                ++small[c];
+            else
+                small[c] = 0;
+            if (it > 1 && small[c] >= 1 && (warm_ok || small[c] >= 2)) {
+                if (!trace) {
+                    done[c] = 1;
+                    continue;
+                }
             }
-            if (rel < 0.7 * best[c]) {
-                best[c] = rel;
+            if (drel < 0.7 * best[c]) {
+                best[c] = drel;
                 stalled[c] = 0;
             } else if (++stalled[c] >= 2 && it > 3) {
-                done[c] = 1;
-                continue;
+                if (!trace) {
+                    /*  2, not 1: a stall is not convergence, and the
+                        step hook below is the one place that can tell
+                        the two apart. Everything else reads done[] as
+                        a flag. */
+                    done[c] = 2;
+                    continue;
+                }
             }
             ++n_active;
         }
         s->mark(0);
+
+        /*  A2 hook: after the stopping test, before the correction. It sees
+            the per-column state and may (a) change inner_j_cur, in which
+            case the GMRES workspace is made sure of here and any column
+            that had only STALLED (done == 2) is put back to work under
+            the new mode, or (b) return nonzero to end the solve with a
+            refactor request. It is called on the exit path too: a stall
+            or a divergence that ended every column is exactly what the
+            policy has to see, and the loop used to leave before it was
+            asked. Without a hook installed this block is a no-op. */
+        if (g_step_hook != nullptr) {
+            int want_j = inner_j_cur;
+            int const rc = g_step_hook(g_step_hook_ctx, it, k, rho_est.data(),
+                                       d_prev.data(), diverged.data(), done.data(),
+                                       &want_j);
+            if (rc != 0) { s->last_refactor_requested = 1; break; }
+            if (want_j != inner_j_cur) {
+                if (want_j > 0 && !ensure_gmres(s, want_j, k)) break;
+                inner_j_cur = want_j;
+                for (std::size_t c = 0; c != k; ++c)
+                    if (done[c] == 2) {
+                        done[c] = 0; stalled[c] = 0; best[c] = 1e30;
+                        ++n_active;
+                    }
+            }
+        }
 
         if (n_active == 0)
             break;
@@ -1668,7 +1895,7 @@ double solve(
             by zeroing its residual -- B0^-1 0 is 0, beta is 0, the
             least squares sees an empty Krylov space, and the update it
             contributes is exactly zero. */
-        if (inner_j > 0) {
+        if (inner_j_cur > 0) {
             for (std::size_t c = 0; c != k; ++c)
                 if (done[c]) {
                     CUDA_CHECK(cudaMemset(s->d_rh + c * ld, 0,
@@ -1678,7 +1905,7 @@ double solve(
                 }
             s->mark(1);
             gmres_inner(s, n, static_cast<int>(k), static_cast<int>(ld),
-                        inner_j, s->d_rh, s->d_rl, s->d_xh, s->d_xl);
+                        inner_j_cur, s->d_rh, s->d_rl, s->d_xh, s->d_xl);
             s->mark(2);
             for (std::size_t c = 0; c != k; ++c)
                 if (!done[c])
@@ -1730,6 +1957,47 @@ double solve(
         for (std::size_t c = 0; c != k; ++c) {
             if (done[c])
                 continue;
+
+            /*  rho estimate from the correction, BEFORE applying it. */
+            CUDA_CHECK(cudaMemset(s->d_nrm, 0, sizeof(float)));
+            LAUNCH((max_abs_kernel<<<g, T>>>(n, s->d_yh + c * ld,
+                                             s->d_nrm)));
+            float dn = 0.f;
+            CUDA_CHECK(cudaMemcpy(&dn, s->d_nrm, sizeof(float),
+                                  cudaMemcpyDeviceToHost));
+            double const dcur = static_cast<double>(dn);
+            if (d_prev[c] > 0. && dcur > 0.) {
+                double const ratio = dcur / d_prev[c];
+                rho_est[c] = ratio;
+                /*  A margin and a minimum iteration count, for the
+                    same reason the stall rule carries `it > 3`: the
+                    first few corrections are not monotone, the residual
+                    that produced them has its own noise, and a bare
+                    "ratio > 1 twice" cut healthy solves off at step 2 --
+                    clustered k=3 kappa=1e8 went from converging in 6 to
+                    stopping at 3. The margin is 5 percent, which is
+                    well inside the 1.10 the diverging cell shows. */
+                /*  RECORD, do not stop.
+
+                    Stopping on "two consecutive growing corrections"
+                    was tried and costs accuracy: correction norms are
+                    not monotone in the first few steps, and the rule
+                    cut clustered k=3 kappa=1e8 from reaching 4.7e-18 in
+                    6 iterations to stopping at 7.8e-15 in 3. The harm
+                    from the old behaviour was never the wasted
+                    iterations -- it was the FALSE VERDICT, and that is
+                    fixed where verdicts are decided rather than by
+                    truncating the solve. The margin is 5 percent, well
+                    inside the 1.10 the diverging cell shows. */
+                if (ratio > 1.05) {
+                    if (++growing[c] >= 2 && it > 3)
+                        diverged[c] = 1;
+                } else {
+                    growing[c] = 0;
+                }
+            }
+            d_prev[c] = dcur;
+
             LAUNCH((add_correction_kernel<<<g, T>>>(
                 n, s->d_yh + c * ld, s->d_yl + c * ld,
                 s->d_xh + c * ld, s->d_xl + c * ld)));
@@ -1755,6 +2023,18 @@ double solve(
 
     if (n_iterations != nullptr)
         *n_iterations = used;
+
+    /*  The worst column's rho estimate and whether any column was cut
+        off for diverging. Exposed because a caller that only sees the
+        backward error cannot tell a converged solve from a diverging
+        one on an ill-conditioned problem. */
+    s->last_rho = 0.;
+    s->last_diverged = 0;
+    for (std::size_t c = 0; c != k; ++c) {
+        s->last_rho = std::max(s->last_rho, rho_est[c]);
+        if (diverged[c])
+            s->last_diverged = 1;
+    }
 
     return ms;
 }
@@ -1835,6 +2115,56 @@ std::size_t saturation_verify(state *s, int const depth) {
     flag lives beside it; there is one device symbol and it applies to
     whatever factors next. Calls are cheap and the gates set it
     explicitly on both sides rather than relying on the default. */
+/*  Apply the preconditioner B_0^-1 = U^-1 L^-1 P once, through the
+    SAME DF32 triangular-solve path refinement uses.
+
+    The point is that rho(M) measured from a dumped factor is a property
+    of the dumped operator, not of the one the solve applies. Those can
+    differ by a few percent, and a few percent is decisive when the
+    eigenvalue sits at 0.524 against a threshold of 0.5. This gives
+    Mv = Ahat^-1(Av) - v on the REALIZED operator, so the spectral radius
+    that governs the iteration can be measured directly -- and it is the
+    same operator-access trick that makes this tractable at large n,
+    where forming M is out of the question. */
+void apply_inverse(state *s, double *d_out, double const *d_in) {
+
+    if (s == nullptr)
+        return;
+
+    int const  n  = static_cast<int>(s->n);
+    int const  T  = 256;
+    int const  g  = (n + T - 1) / T;
+    std::size_t const ld = s->n;
+
+    LAUNCH((k_split_f64<<<g, T>>>(n, d_in, s->d_rh, s->d_rl)));
+    LAUNCH((gather_kernel<<<g, T>>>(n, s->d_perm, s->d_rh, s->d_rl,
+                                    s->d_yh, s->d_yl)));
+    if (s->srung_ib != 0) {
+        trsv_L_mrhs(n, 256, s->srung_ib, 1, (int)ld,
+                    s->d_hi, s->d_lo, s->d_dlh, s->d_dll,
+                    s->d_yh, s->d_yl, s->d_zh, s->d_zl,
+                    s->d_th, s->d_tl);
+        trsv_U_mrhs(n, 256, s->srung_ib, 1, (int)ld,
+                    s->d_hi, s->d_lo, s->d_duh, s->d_dul,
+                    s->d_zh, s->d_zl, s->d_yh, s->d_yl,
+                    s->d_th, s->d_tl);
+    } else {
+        trsv_L_blocked(n, 256, s->d_hi, s->d_lo, s->d_yh, s->d_yl,
+                       s->d_zh, s->d_zl, s->d_th, s->d_tl);
+        trsv_U_blocked(n, 256, s->d_hi, s->d_lo, s->d_zh, s->d_zl,
+                       s->d_yh, s->d_yl, s->d_th, s->d_tl);
+    }
+    LAUNCH((combine_kernel<<<g, T>>>(n, s->d_yh, s->d_yl, d_out)));
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+void set_force_iters(int const n) { g_force_iters = n; }
+
+double last_rho(state const *s) { return (s != nullptr)? s->last_rho : 0.; }
+bool last_diverged(state const *s) {
+    return (s != nullptr) && s->last_diverged != 0;
+}
+
 void set_rounding(rounding const r) {
     int const v = (r == rounding::stochastic)? 1 : 0;
     CUDA_CHECK(cudaMemcpyToSymbol(lps_sr_mode, &v, sizeof v));
@@ -1844,6 +2174,65 @@ void set_sr_stream(unsigned long long const stream) {
     CUDA_CHECK(cudaMemcpyToSymbol(lps_sr_stream, &stream, sizeof stream));
 }
 
+void set_depths(int const kL, int const kU) {
+    /*  Both the device loop and the host pair list have to see this, and
+        the host mirror is per-TU (the vendored header declares it static,
+        being included by five of them), so the only copy that matters is
+        the one in this TU -- the same TU that calls
+        int8lu_scratch_alloc. Zero restores the symmetric path. */
+    int const vL = (kL > 0)? kL : 0;
+    int const vU = (kU > 0)? kU : 0;
+    CUDA_CHECK(cudaMemcpyToSymbol(lps_kfacL, &vL, sizeof vL));
+    CUDA_CHECK(cudaMemcpyToSymbol(lps_kfacU, &vU, sizeof vU));
+    g_lps_kfacL_h = vL;
+    g_lps_kfacU_h = vU;
+}
+
+/*  A3: the interchange sequence, as the panel wrote it -- piv[c] is the
+    ABSOLUTE row swapped into column c, which is what set_forced_pivots
+    takes back. Distinct from copy_factor's `pv`, which is the composed
+    permutation. */
+void copy_pivots(state const *s, int *out) {
+    if (s == nullptr || out == nullptr) return;
+    CUDA_CHECK(cudaMemcpy(out, s->d_piv, s->n * sizeof(int),
+                          cudaMemcpyDeviceToHost));
+}
+
+void set_forced_pivots(state *s, int const *host_piv) {
+    /*  nullptr restores the search. The device copy lives on the state so
+        it outlives the call, and is freed with the state. */
+    if (s == nullptr) return;
+    if (host_piv == nullptr) {
+        int *nul = nullptr;
+        CUDA_CHECK(cudaMemcpyToSymbol(lps_forced_piv, &nul, sizeof nul));
+        return;
+    }
+    if (s->d_forced == nullptr)
+        s->d_forced = static_cast<int *>(s->acquire(s->n * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(s->d_forced, host_piv, s->n * sizeof(int),
+                          cudaMemcpyHostToDevice));
+    int *p = s->d_forced;
+    CUDA_CHECK(cudaMemcpyToSymbol(lps_forced_piv, &p, sizeof p));
+}
+
+void set_step_hook(step_hook_fn fn, void *ctx) {
+    g_step_hook = fn;
+    g_step_hook_ctx = ctx;
+}
+
+bool last_refactor_requested(state const *s) {
+    return (s != nullptr) && s->last_refactor_requested != 0;
+}
+
+void depths(state const *s, int *kL, int *kU) {
+    if (kL != nullptr) *kL = (s != nullptr)? s->scratch.kfacL : 0;
+    if (kU != nullptr) *kU = (s != nullptr)? s->scratch.kfacU : 0;
+}
+
+int pair_count(state const *s) {
+    return (s != nullptr)? s->scratch.npair : 0;
+}
+
 bool saturation(
     state      *s,
     int const   c0,
@@ -1851,7 +2240,8 @@ bool saturation(
     int        *out,
     float      *g_max,
     int        *isat_i0,
-    int const   qmax) {
+    int const   qmax,
+    int        *uf_out) {
 
     if (s == nullptr || out == nullptr)
         return false;
@@ -1885,6 +2275,15 @@ bool saturation(
     if (isat_i0 != nullptr)
         CUDA_CHECK(cudaMemcpy(isat_i0, d_si, QLU_I0MAX * n * sizeof(int),
                               cudaMemcpyDeviceToHost));
+    /*  Per-row underflow level, exposed because it is the only thing
+        that separates two mechanisms for a cascade stopping: the
+        residual reaching the fp32 floor (uf in range) versus
+        contributions being absorbed while the residual is still
+        representable (uf == 0). Inferring it from 19*log2(254) ~ 2^-149
+        landing on the fp32 min denormal would be a coincidence
+        argument, not a measurement. */
+    if (uf_out != nullptr)
+        std::copy(uf.begin(), uf.end(), uf_out);
     cudaFree(d_last);
     cudaFree(d_uf);
     cudaFree(d_g);

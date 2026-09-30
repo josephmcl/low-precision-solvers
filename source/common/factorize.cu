@@ -1,5 +1,6 @@
 #include "common/factorize.h"
 #include "common/tuning.h"
+#include "common/cusolver_emu.h"
 
 namespace factorize {
 

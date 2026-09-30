@@ -133,6 +133,16 @@ SAT_MAIN    := $(TOBJ_DIR)/main_saturation.o
 CONS_MAIN   := $(TOBJ_DIR)/consistency/main_paths.o
 ABS_MAIN    := $(TOBJ_DIR)/consistency/main_absorb.o
 SR_MAIN     := $(TOBJ_DIR)/consistency/main_sr.o
+RLZM_MAIN   := $(TOBJ_DIR)/main_realized_m.o
+BLKS_MAIN   := $(TOBJ_DIR)/main_blockscale.o
+ASYMD_MAIN  := $(TOBJ_DIR)/main_asymdepth.o
+FDUMP_MAIN  := $(TOBJ_DIR)/main_factordump.o
+FPIV_MAIN   := $(TOBJ_DIR)/main_forcepiv.o
+A4_MAIN     := $(TOBJ_DIR)/main_a4.o
+A5_MAIN     := $(TOBJ_DIR)/main_a5.o
+C4_MAIN     := $(TOBJ_DIR)/main_c4.o
+SSTEP_MAIN  := $(TOBJ_DIR)/main_solvestep.o
+A2_MAIN     := $(TOBJ_DIR)/main_a2.o
 MART_MAIN   := $(TOBJ_DIR)/consistency/main_martingale.o
 CAMP_MAIN   := $(TOBJ_DIR)/campaign/main_accuracy.o
 INSTR_DIR   := build/instrumented
@@ -151,6 +161,10 @@ all: $(BIN_DIR)/lps-sweep $(BIN_DIR)/lps-probe $(BIN_DIR)/lps-ozaki-test \
      $(BIN_DIR)/lps-lift-dump $(BIN_DIR)/lps-oii-gemm \
      $(BIN_DIR)/lps-oii-guard $(BIN_DIR)/lps-saturation \
      $(BIN_DIR)/lps-consistency $(BIN_DIR)/lps-absorb $(BIN_DIR)/lps-sr \
+     $(BIN_DIR)/lps-realized-m $(BIN_DIR)/lps-blockscale \
+     $(BIN_DIR)/lps-asymdepth $(BIN_DIR)/lps-factordump \
+     $(BIN_DIR)/lps-forcepiv $(BIN_DIR)/lps-a4 $(BIN_DIR)/lps-a5 $(BIN_DIR)/lps-c4 \
+     $(BIN_DIR)/lps-solvestep $(BIN_DIR)/lps-a2 \
      $(BIN_DIR)/lps-martingale \
      $(BIN_DIR)/lps-campaign
 
@@ -235,6 +249,36 @@ $(BIN_DIR)/lps-campaign: $(COMMON) $(COM_OBJ)/reference.o $(CAMP_MAIN) | $(BIN_D
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
 
 $(BIN_DIR)/lps-martingale: $(COMMON) $(MART_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN_DIR)/lps-blockscale: $(COMMON) $(BLKS_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN_DIR)/lps-asymdepth: $(COMMON) $(ASYMD_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN_DIR)/lps-factordump: $(COMMON) $(FDUMP_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN_DIR)/lps-forcepiv: $(COMMON) $(FPIV_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN_DIR)/lps-a4: $(COMMON) $(A4_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN_DIR)/lps-a5: $(COMMON) $(A5_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN_DIR)/lps-c4: $(COMMON) $(C4_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN_DIR)/lps-solvestep: $(COMMON) $(SSTEP_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN_DIR)/lps-a2: $(COMMON) $(A2_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN_DIR)/lps-realized-m: $(COMMON) $(RLZM_MAIN) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
 
 $(BIN_DIR)/lps-sr: $(COMMON) $(SR_MAIN) | $(BIN_DIR)
