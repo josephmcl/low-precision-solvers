@@ -1,6 +1,7 @@
 #include "common/qlu.h"
 
 #include <cstdlib>
+#include <string>
 
 #include "common/convert.h"
 #include "common/oii_gemm.h"
@@ -1529,6 +1530,48 @@ double factor(state *s) {
         }
     }
 
+/*  The fused trailing update, chosen per factorization.
+
+    It reproduces the unfused update bit for bit -- factor words and pivot
+    sequence identical, and the realized rho of the iteration matrix identical
+    on all 288 depth pairs of the 48-cell grid -- so there is nothing to trade
+    off; the reason it is not simply always on is shape. `k_int8lu_fused` aborts
+    the PROCESS unless every panel has mp % 16 == 0 and np % 64 == 0, and with a
+    uniform panel width mp = np = n - (j+1) b, so that reduces to n % 64 == 0 and
+    b % 64 == 0. A SuiteSparse matrix at n = 2339 exits(4) on the first panel.
+
+    Within the safe shapes, FUSE=5 is the TMA path and wants b = 256 with n a
+    multiple of 256, and FUSE=3 is the 64x64 tile, which falls through to the
+    16x16 kernel on its own tail panels. The vendored code reads the choice from
+    the environment, which is therefore the only channel; an explicit setting
+    from the caller always wins, and is captured on the first call so that a
+    later shape cannot overwrite it.
+
+    This runs after create, so the scratch for the unfused path is still
+    allocated; folding that into create is a separate change (it is the term
+    that makes the scratch scale with the depth). */
+void select_fused_update(std::size_t const n, int const b) {
+    static bool captured = false;
+    static std::string caller_set;
+    if (!captured) {
+        char const *e = std::getenv("FUSE");
+        caller_set = (e != nullptr)? e : "";
+        captured = true;
+    }
+    if (!caller_set.empty())
+        return;
+
+    bool const shape_ok = (n % 64 == 0) && (b % 64 == 0);
+    if (!shape_ok) {
+        unsetenv("FUSE");
+        return;
+    }
+    if (b == 256 && n % 256 == 0)
+        setenv("FUSE", "5", 1);
+    else
+        setenv("FUSE", "3", 1);
+}
+
     timing::stopwatch watch;
     watch.start();
 
@@ -1538,6 +1581,7 @@ double factor(state *s) {
                         s->oii_s))
             return -1.;
     } else {
+        select_fused_update(s->n, s->b);
         int8lu_factor(s->blas, static_cast<int>(s->n), s->b, s->kfac,
                       UPD_INT8, s->d_hi, s->d_lo, s->d_piv, s->scratch);
     }
