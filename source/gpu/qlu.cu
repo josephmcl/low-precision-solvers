@@ -1502,34 +1502,6 @@ bool oii_factor(
     return true;
 }
 
-double factor(state *s) {
-
-    if (s == nullptr)
-        return 0.;
-
-    /*  The pair set is decided in two places that must agree: the host
-        list (npair/isarr/jsarr, built by int8lu_scratch_alloc at CREATE
-        time from the host mirror) and the device loop (which reads
-        lps_kfacL/lps_kfacU at FACTOR time). Calling set_depths after
-        create leaves them describing different sets, and since the
-        kernels index P by a shared pair counter that is a wrong answer
-        rather than a crash. Cheap to check once per factorization. */
-    {
-        int dL = 0, dU = 0;
-        CUDA_CHECK(cudaMemcpyFromSymbol(&dL, lps_kfacL, sizeof dL));
-        CUDA_CHECK(cudaMemcpyFromSymbol(&dU, lps_kfacU, sizeof dU));
-        int const wantL = (dL > 0)? dL : s->scratch.kfac;
-        int const wantU = (dU > 0)? dU : s->scratch.kfac;
-        if (wantL != s->scratch.kfacL || wantU != s->scratch.kfacU) {
-            std::fprintf(stderr,
-                "[qlu] depth mismatch: this state was built for "
-                "(k_L=%d, k_U=%d) but the device is set to (%d, %d). "
-                "set_depths must be called BEFORE create.\n",
-                s->scratch.kfacL, s->scratch.kfacU, wantL, wantU);
-            return -1.;
-        }
-    }
-
 /*  The fused trailing update, chosen per factorization.
 
     It reproduces the unfused update bit for bit -- factor words and pivot
@@ -1571,6 +1543,34 @@ void select_fused_update(std::size_t const n, int const b) {
     else
         setenv("FUSE", "3", 1);
 }
+
+double factor(state *s) {
+
+    if (s == nullptr)
+        return 0.;
+
+    /*  The pair set is decided in two places that must agree: the host
+        list (npair/isarr/jsarr, built by int8lu_scratch_alloc at CREATE
+        time from the host mirror) and the device loop (which reads
+        lps_kfacL/lps_kfacU at FACTOR time). Calling set_depths after
+        create leaves them describing different sets, and since the
+        kernels index P by a shared pair counter that is a wrong answer
+        rather than a crash. Cheap to check once per factorization. */
+    {
+        int dL = 0, dU = 0;
+        CUDA_CHECK(cudaMemcpyFromSymbol(&dL, lps_kfacL, sizeof dL));
+        CUDA_CHECK(cudaMemcpyFromSymbol(&dU, lps_kfacU, sizeof dU));
+        int const wantL = (dL > 0)? dL : s->scratch.kfac;
+        int const wantU = (dU > 0)? dU : s->scratch.kfac;
+        if (wantL != s->scratch.kfacL || wantU != s->scratch.kfacU) {
+            std::fprintf(stderr,
+                "[qlu] depth mismatch: this state was built for "
+                "(k_L=%d, k_U=%d) but the device is set to (%d, %d). "
+                "set_depths must be called BEFORE create.\n",
+                s->scratch.kfacL, s->scratch.kfacU, wantL, wantU);
+            return -1.;
+        }
+    }
 
     timing::stopwatch watch;
     watch.start();
