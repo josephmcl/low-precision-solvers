@@ -236,6 +236,14 @@ typedef int (*step_hook_fn)(void *ctx, std::size_t it, std::size_t k,
 void set_step_hook(step_hook_fn fn, void *ctx);
 bool last_refactor_requested(state const *s);
 
+/*  Whether the last solve's answer is certified: every column stopped with
+    its normalised residual ||b - Ax|| / (||A|| ||x|| + ||b||) (infinity
+    norms, formed in DF32) at or below 8 u_ff. A solve that stalled, ran out
+    of iterations or diverged above that level returns false, and its X is
+    not a solution. last_residual is the worst column's value. */
+bool last_converged(state const *s);
+double last_residual(state const *s);
+
 void set_force_iters(int const n);
 
 double last_rho(state const *s);

@@ -113,6 +113,18 @@ __global__ void k_inf_norm_rows(int const n, float const *ah,
                           __float_as_int(red[0]));
 }
 
+/*  fmaxf drops a NaN, so a vector of NaNs has max-norm 0 and a diverged
+    solve reads as an exact one. This is the test that cannot be fooled. */
+__global__ void any_nonfinite_kernel(
+    int const    n,
+    float const *v,
+    float       *out) {
+
+    int const i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n && !isfinite(v[i]))
+        *out = 1.f;
+}
+
 __global__ void max_abs_kernel(
     int const    n,
     float const *v,
@@ -177,6 +189,8 @@ struct state {
     int *d_piv  = nullptr;   /* getrf-style interchanges                 */
     int *d_forced = nullptr; /* A3 forced interchange sequence           */
     int  last_refactor_requested = 0;   /* A2: hook ended the solve */
+    int    last_converged = 0;          /* every column met the residual test */
+    double last_rel       = 0.;         /* worst column's last normalised residual */
     int *d_perm = nullptr;   /* composed permutation, host-built         */
 
     /*  Solve workspace. */
@@ -1840,25 +1854,37 @@ void select_panel_variant() {
         want = (e != nullptr)? e : "auto";
         captured = true;
     }
-    /*  The U12 block solve as a product with inverted 32 x 32 diagonal blocks
-        instead of a 64-row dependent chain per warp: 8 ms of 372 at b = 256
-        and 19 ms of 588 at b = 128, same pivots, max |L| = 1. Off by default.
-        It matched the chain on 2157 of 2160 depth pairs; the three that
-        differ are one matrix (random, n = 3000, b = 128, depth 2) whose
-        contraction and forward error are unchanged but whose backward error
-        stagnates at 1.9e-15 instead of 6.1e-16, across the acceptance level.
-        The gate counts that as a regression, so the chain stays the default
-        until the sliced block row replaces it. LPS_U12=inverse selects it. */
+    /*  The block row U12.
+
+        Default: U12 = S12 + G S12 with G = J - I, J the computed b x b inverse
+        of L11. S12 is already in the carrier at storage precision, so only
+        G S12 is formed from integer slices. Its depth is the PRODUCER depth
+        k_P = k_T + 2, two levels below the trailing update's k_T: that is the
+        first depth at which the sliced row reproduces the chain's convergence
+        on every pair tested (1080 depth pairs at n = 2048, 3072, 2000: no
+        regression, no improvement, realized rho within 4 % in the median).
+        At k_T + 1 three clustered cells at n = 3072 that converge with the
+        chain diverge; at k_T the gate fails outright. At n = 16384, b = 256
+        the factor is 272 ms against 314 for the chain at k_T = 4 and 207
+        against 254 at k_T = 2. Panels whose shape the product cannot take
+        (b not a multiple of 32, or a trailing width not a multiple of 16) use
+        the chain.
+
+        LPS_U12=chain     the blocked triangular solve.
+        LPS_U12=inverse   the solve as products with inverted 32 x 32 diagonal
+                          blocks in storage precision.
+        LPS_U12=sliced, sliced+1   k_P = k_T, k_T + 1, for experiments. */
     {
         char const *u = std::getenv("LPS_U12");
-        if (u != nullptr && std::string(u) == "inverse")
+        std::string const w = (u != nullptr)? u : "sliced+2";
+        if (w == "inverse")
             setenv("LPS_U12INV", "1", 1);
-        /*  Experimental: the block row as U12 = S12 + G S12 with G = L11^-1 - I
-            sliced at the trailing depth ("sliced") or one level deeper. */
-        if (u != nullptr && std::string(u) == "sliced")
+        else if (w == "sliced")
             setenv("LPS_U12S", "0", 1);
-        if (u != nullptr && std::string(u) == "sliced+1")
+        else if (w == "sliced+1")
             setenv("LPS_U12S", "1", 1);
+        else if (w == "sliced+2")
+            setenv("LPS_U12S", "2", 1);
     }
     if (caller_drives || want == "off")
         return;
@@ -2164,6 +2190,9 @@ double solve(
     std::vector<int>         growing(k, 0);
     std::vector<char>        diverged(k, 0);
     std::vector<int>         small(k, 0);
+    std::vector<double>      best_rel(k, 1e30);
+    std::vector<double>      rel_last(k, 1.);
+    std::vector<char>        certified(k, 0);
 
     for (std::size_t it = 0; it != cap; ++it) {
 
@@ -2251,22 +2280,84 @@ double solve(
                 ++small[c];
             else
                 small[c] = 0;
+
+            /*  SUCCESS IS THE RESIDUAL TEST. The correction test and the
+                stall rule say when to stop iterating; neither certifies
+                the answer. A column is converged only if, when one of them
+                fires, the normalised residual
+
+                    ||b - A x||_inf / (||A||_inf ||x||_inf + ||b||_inf)
+
+                is at the level this residual can resolve. It is formed in
+                DF32, so its own noise is a few u_ff (0.3 to 4 u_ff at the
+                floor on the cells traced); RESID_TOL = 8 u_ff. A column
+                that stops above it is reported as not converged
+                (last_converged), whatever stopped it.
+
+                Before this, three cells of the closed-loop set returned a
+                backward error of 1e-9 to 1e-12 and a forward error up to
+                1e4 as if solved: their residual wanders for the first four
+                steps (2e-8, 8e-8, 6e-8, 7e-8, then a clean 0.3x a step),
+                the correction ratio did not improve over those steps, and
+                the stall rule ended the solve at step 4. */
+            double const RESID_TOL = 8. * 0x1p-49;
+            /*  A residual of exactly zero after the first step, or a
+                non-finite norm, is an overflowed iterate, not a solution:
+                the max-norm kernels drop NaNs. The entries themselves are
+                checked where a column is certified. */
+            bool const sane = std::isfinite(rel) && std::isfinite(static_cast<double>(x_n))
+                           && !(it > 0 && (r_norm == 0.f || x_n == 0.f));
+            bool resid_ok = sane && rel <= RESID_TOL;
+            if (resid_ok && it > 0) {
+                CUDA_CHECK(cudaMemset(s->d_nrm, 0, sizeof(float)));
+                LAUNCH((any_nonfinite_kernel<<<g, T>>>(n, s->d_xh + c * ld, s->d_nrm)));
+                LAUNCH((any_nonfinite_kernel<<<g, T>>>(n, s->d_rh + c * ld, s->d_nrm)));
+                float bad = 0.f;
+                CUDA_CHECK(cudaMemcpy(&bad, s->d_nrm, sizeof(float), cudaMemcpyDeviceToHost));
+                if (bad != 0.f)
+                    resid_ok = false;
+            }
+            rel_last[c] = sane? rel : 1e300;
+            if (!sane && it > 3 && !trace) {
+                /*  nothing can come back from an overflowed iterate */
+                done[c] = 2; certified[c] = 0; diverged[c] = 1;
+                continue;
+            }
+
             if (it > 1 && small[c] >= 1 && (warm_ok || small[c] >= 2)) {
                 if (!trace) {
-                    done[c] = 1;
+                    /*  the correction is at the carrier's noise: nothing
+                        further will move. Converged if the residual says
+                        so, stagnated above tolerance otherwise. */
+                    done[c] = resid_ok? 1 : 2;
+                    certified[c] = resid_ok? 1 : 0;
                     continue;
                 }
             }
-            if (drel < 0.7 * best[c]) {
-                best[c] = drel;
+            /*  Progress is progress in EITHER quantity. A stall is two
+                steps in which neither the correction nor the residual
+                improved; judged on the correction alone, a residual that
+                was still falling 0.3x a step was cut off. */
+            bool improved = false;
+            if (drel < 0.7 * best[c]) { best[c] = drel; improved = true; }
+            if (rel < 0.7 * best_rel[c]) { best_rel[c] = rel; improved = true; }
+            if (improved) {
                 stalled[c] = 0;
-            } else if (++stalled[c] >= 2 && it > 3) {
+            } else if (++stalled[c] >= 2 && it > 3 && resid_ok) {
                 if (!trace) {
                     /*  2, not 1: a stall is not convergence, and the
                         step hook below is the one place that can tell
                         the two apart. Everything else reads done[] as
-                        a flag. */
+                        a flag.
+
+                        A stall ends the column only where the residual
+                        is already at tolerance: the iteration has reached
+                        its floor. Above tolerance two flat steps prove
+                        nothing -- the residual of a contracting iteration
+                        is not monotone at the start -- so the column goes
+                        on to the cap and is reported from there. */
                     done[c] = 2;
+                    certified[c] = 1;
                     continue;
                 }
             }
@@ -2444,10 +2535,20 @@ double solve(
         one on an ill-conditioned problem. */
     s->last_rho = 0.;
     s->last_diverged = 0;
+    s->last_converged = 1;
+    s->last_rel = 0.;
     for (std::size_t c = 0; c != k; ++c) {
         s->last_rho = std::max(s->last_rho, rho_est[c]);
         if (diverged[c])
             s->last_diverged = 1;
+        /*  A column that ran to the cap, or under a trace, never passed
+            through an exit: it is judged on the last residual it formed,
+            which is one correction behind. */
+        bool const ok = done[c]? (certified[c] != 0)
+                               : (rel_last[c] <= 8. * 0x1p-49);
+        if (!ok)
+            s->last_converged = 0;
+        s->last_rel = std::max(s->last_rel, rel_last[c]);
     }
 
     return ms;
@@ -2632,6 +2733,14 @@ void set_forced_pivots(state *s, int const *host_piv) {
 void set_step_hook(step_hook_fn fn, void *ctx) {
     g_step_hook = fn;
     g_step_hook_ctx = ctx;
+}
+
+bool last_converged(state const *s) {
+    return (s != nullptr) && s->last_converged != 0;
+}
+
+double last_residual(state const *s) {
+    return (s != nullptr)? s->last_rel : 0.;
 }
 
 bool last_refactor_requested(state const *s) {
