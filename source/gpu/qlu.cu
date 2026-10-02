@@ -256,6 +256,9 @@ struct state {
     }
 };
 
+void select_panel_variant();        /*  defined below, called from create because the
+                                        vendored allocator reads FLAG */
+
 state *create(
     std::size_t const n,
     int const         b,
@@ -344,6 +347,9 @@ state *create(
         }
     }
 
+    /*  Before the scratch, not before the factor: the vendored allocator reads
+        FLAG itself and sizes the panel's buffers from it. */
+    select_panel_variant();
     int8lu_scratch_alloc(s->scratch, static_cast<int>(n), b_use, kfac);
 
     if (which == kernel::oii) {
@@ -1188,6 +1194,278 @@ __global__ void k_diag_apply_U_mrhs(
     }
 }
 
+/*  The triangular solves for ONE right-hand side.
+
+    The batched kernels above take their parallelism from the right-hand
+    sides: the diagonal kernel is launched with one block per column of B and
+    the off-diagonal one with a warp per (row, column of B). With a single
+    right-hand side that is one block for the first and 32 for the second on a
+    device with 132 SMs, and the diagonal kernel reads the factor down a column
+    -- one cache line per lane. nsys at n = 16384 put the two solves at 22 ms a
+    refinement step, about forty times what reading the triangle once costs.
+
+    These walk the same 256-row groups right-looking instead. Once a group is
+    solved its contribution is removed from EVERY remaining row at once, a warp
+    per row reading 256 contiguous factor entries, so the width of the update
+    is the height of the matrix rather than the number of right-hand sides.
+    Inside a group the S-rung inverses are applied as before and the in-group
+    elimination reads each row contiguously.
+
+    The residual is accumulated group by group in DF32 rather than summed and
+    subtracted once, so the result is not bit-identical to the batched path;
+    like the S-rung itself it is a reordering that refinement absorbs, and it
+    is gated on the iteration count and the verdict. LPS_TRSV_MRHS=1 selects
+    the batched kernels for a comparison. */
+__global__ void k_trsv1_update(
+    int const    n,
+    int const    r0,
+    int const    nr,
+    int const    c0,
+    int const    nc,
+    float const *luh,
+    float const *lul,
+    float const *yh,
+    float const *yl,
+    float       *rh,
+    float       *rl) {
+
+    int const gw   = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int const lane = threadIdx.x & 31;
+    if (gw >= nr)
+        return;
+    std::size_t const row = static_cast<std::size_t>(r0 + gw) * n;
+
+    df32 acc = df_make(0.f, 0.f);
+    for (int j = lane; j < nc; j += 32)
+        acc = df_add_acc(acc, df_mul(
+            df_make(luh[row + c0 + j], lul[row + c0 + j]),
+            df_make(yh[c0 + j], yl[c0 + j])));
+    for (int o = 16; o > 0; o >>= 1) {
+        float const oh = __shfl_down_sync(0xffffffffu, acc.hi, o);
+        float const ol = __shfl_down_sync(0xffffffffu, acc.lo, o);
+        acc = df_add_acc(acc, df_make(oh, ol));
+    }
+    if (lane == 0) {
+        df32 const v = df_sub_acc(df_make(rh[r0 + gw], rl[r0 + gw]), acc);
+        rh[r0 + gw] = v.hi;
+        rl[r0 + gw] = v.lo;
+    }
+}
+
+__global__ void k_trsv1_group_L(
+    int const    n,
+    int const    i0,
+    int const    ni,
+    int const    ib,
+    float const *luh,
+    float const *lul,
+    float const *dh,
+    float const *dl,
+    float const *rh,
+    float const *rl,
+    float       *yh,
+    float       *yl) {
+
+    __shared__ float rsh[256], rsl[256], ysh[256], ysl[256];
+    int const t = threadIdx.x, lane = t & 31, w = t >> 5;
+    int const nw = blockDim.x >> 5;
+
+    for (int m = t; m < ni; m += blockDim.x) {
+        rsh[m] = rh[i0 + m];
+        rsl[m] = rl[i0 + m];
+    }
+    __syncthreads();
+
+    for (int sb = 0; sb < ni; sb += ib) {
+        int const sw = (ni - sb < ib)? (ni - sb) : ib;
+        /*  The inverse block times the sub-block's residual, a warp per row:
+            a thread per row walked the row one entry at a time, 64 dependent
+            loads each on its own cache line, and that chain was the whole
+            cost of this kernel (104 us against 10 us for the update of every
+            remaining row of the matrix). */
+        {
+            float const *mh = dh + static_cast<std::size_t>((i0 + sb) / ib) * ib * ib;
+            float const *ml = dl + static_cast<std::size_t>((i0 + sb) / ib) * ib * ib;
+            for (int row = w; row < sw; row += nw) {
+                df32 acc = df_make(0.f, 0.f);
+                for (int q = lane; q < sw; q += 32)
+                    acc = df_add_acc(acc, df_mul(
+                        df_make(mh[row * ib + q], ml[row * ib + q]),
+                        df_make(rsh[sb + q], rsl[sb + q])));
+                for (int o = 16; o > 0; o >>= 1) {
+                    float const oh = __shfl_down_sync(0xffffffffu, acc.hi, o);
+                    float const ol = __shfl_down_sync(0xffffffffu, acc.lo, o);
+                    acc = df_add_acc(acc, df_make(oh, ol));
+                }
+                if (lane == 0) {
+                    ysh[sb + row] = acc.hi;
+                    ysl[sb + row] = acc.lo;
+                }
+            }
+        }
+        __syncthreads();
+
+        /*  Remove this sub-block from the rows of the group still to come,
+            a warp per row so the factor is read along the row. */
+        for (int row = sb + sw + w; row < ni; row += nw) {
+            std::size_t const base =
+                static_cast<std::size_t>(i0 + row) * n + (i0 + sb);
+            df32 acc = df_make(0.f, 0.f);
+            for (int j = lane; j < sw; j += 32)
+                acc = df_add_acc(acc, df_mul(
+                    df_make(luh[base + j], lul[base + j]),
+                    df_make(ysh[sb + j], ysl[sb + j])));
+            for (int o = 16; o > 0; o >>= 1) {
+                float const oh = __shfl_down_sync(0xffffffffu, acc.hi, o);
+                float const ol = __shfl_down_sync(0xffffffffu, acc.lo, o);
+                acc = df_add_acc(acc, df_make(oh, ol));
+            }
+            if (lane == 0) {
+                df32 const v = df_sub_acc(df_make(rsh[row], rsl[row]), acc);
+                rsh[row] = v.hi;
+                rsl[row] = v.lo;
+            }
+        }
+        __syncthreads();
+    }
+    for (int m = t; m < ni; m += blockDim.x) {
+        yh[i0 + m] = ysh[m];
+        yl[i0 + m] = ysl[m];
+    }
+}
+
+__global__ void k_trsv1_group_U(
+    int const    n,
+    int const    i0,
+    int const    ni,
+    int const    ib,
+    float const *luh,
+    float const *lul,
+    float const *dh,
+    float const *dl,
+    float const *rh,
+    float const *rl,
+    float       *yh,
+    float       *yl) {
+
+    __shared__ float rsh[256], rsl[256], ysh[256], ysl[256];
+    int const t = threadIdx.x, lane = t & 31, w = t >> 5;
+    int const nw = blockDim.x >> 5;
+
+    for (int m = t; m < ni; m += blockDim.x) {
+        rsh[m] = rh[i0 + m];
+        rsl[m] = rl[i0 + m];
+    }
+    __syncthreads();
+
+    for (int sb = ((ni - 1) / ib) * ib; sb >= 0; sb -= ib) {
+        int const sw = (sb + ib <= ni)? ib : (ni - sb);
+        /*  The inverse block times the sub-block's residual, a warp per row:
+            a thread per row walked the row one entry at a time, 64 dependent
+            loads each on its own cache line, and that chain was the whole
+            cost of this kernel (104 us against 10 us for the update of every
+            remaining row of the matrix). */
+        {
+            float const *mh = dh + static_cast<std::size_t>((i0 + sb) / ib) * ib * ib;
+            float const *ml = dl + static_cast<std::size_t>((i0 + sb) / ib) * ib * ib;
+            for (int row = w; row < sw; row += nw) {
+                df32 acc = df_make(0.f, 0.f);
+                for (int q = lane; q < sw; q += 32)
+                    acc = df_add_acc(acc, df_mul(
+                        df_make(mh[row * ib + q], ml[row * ib + q]),
+                        df_make(rsh[sb + q], rsl[sb + q])));
+                for (int o = 16; o > 0; o >>= 1) {
+                    float const oh = __shfl_down_sync(0xffffffffu, acc.hi, o);
+                    float const ol = __shfl_down_sync(0xffffffffu, acc.lo, o);
+                    acc = df_add_acc(acc, df_make(oh, ol));
+                }
+                if (lane == 0) {
+                    ysh[sb + row] = acc.hi;
+                    ysl[sb + row] = acc.lo;
+                }
+            }
+        }
+        __syncthreads();
+
+        for (int row = w; row < sb; row += nw) {
+            std::size_t const base =
+                static_cast<std::size_t>(i0 + row) * n + (i0 + sb);
+            df32 acc = df_make(0.f, 0.f);
+            for (int j = lane; j < sw; j += 32)
+                acc = df_add_acc(acc, df_mul(
+                    df_make(luh[base + j], lul[base + j]),
+                    df_make(ysh[sb + j], ysl[sb + j])));
+            for (int o = 16; o > 0; o >>= 1) {
+                float const oh = __shfl_down_sync(0xffffffffu, acc.hi, o);
+                float const ol = __shfl_down_sync(0xffffffffu, acc.lo, o);
+                acc = df_add_acc(acc, df_make(oh, ol));
+            }
+            if (lane == 0) {
+                df32 const v = df_sub_acc(df_make(rsh[row], rsl[row]), acc);
+                rsh[row] = v.hi;
+                rsl[row] = v.lo;
+            }
+        }
+        __syncthreads();
+    }
+    for (int m = t; m < ni; m += blockDim.x) {
+        yh[i0 + m] = ysh[m];
+        yl[i0 + m] = ysl[m];
+    }
+}
+
+bool trsv_single_rhs() {
+    static int const batched = (std::getenv("LPS_TRSV_MRHS") != nullptr)? 1 : 0;
+    return batched == 0;
+}
+
+void trsv_L_one(
+    int const n, int const blk, int const ib,
+    float const *luh, float const *lul, float const *dlh, float const *dll,
+    float const *bh, float const *bl, float *yh, float *yl,
+    float *rh, float *rl) {
+
+    CUDA_CHECK(cudaMemcpyAsync(rh, bh, n * sizeof(float),
+                               cudaMemcpyDeviceToDevice, 0));
+    CUDA_CHECK(cudaMemcpyAsync(rl, bl, n * sizeof(float),
+                               cudaMemcpyDeviceToDevice, 0));
+    for (int i0 = 0; i0 < n; i0 += blk) {
+        int const ni = (i0 + blk <= n)? blk : (n - i0);
+        k_trsv1_group_L<<<1, 1024>>>(n, i0, ni, ib, luh, lul, dlh, dll,
+                                    rh, rl, yh, yl);
+        KERNEL_CHECK();
+        int const nr = n - i0 - ni;
+        if (nr > 0) {
+            k_trsv1_update<<<(nr * 32 + 255) / 256, 256>>>(
+                n, i0 + ni, nr, i0, ni, luh, lul, yh, yl, rh, rl);
+            KERNEL_CHECK();
+        }
+    }
+}
+
+void trsv_U_one(
+    int const n, int const blk, int const ib,
+    float const *luh, float const *lul, float const *duh, float const *dul,
+    float const *bh, float const *bl, float *yh, float *yl,
+    float *rh, float *rl) {
+
+    CUDA_CHECK(cudaMemcpyAsync(rh, bh, n * sizeof(float),
+                               cudaMemcpyDeviceToDevice, 0));
+    CUDA_CHECK(cudaMemcpyAsync(rl, bl, n * sizeof(float),
+                               cudaMemcpyDeviceToDevice, 0));
+    for (int i0 = ((n - 1) / blk) * blk; i0 >= 0; i0 -= blk) {
+        int const ni = (i0 + blk <= n)? blk : (n - i0);
+        k_trsv1_group_U<<<1, 1024>>>(n, i0, ni, ib, luh, lul, duh, dul,
+                                    rh, rl, yh, yl);
+        KERNEL_CHECK();
+        if (i0 > 0) {
+            k_trsv1_update<<<(i0 * 32 + 255) / 256, 256>>>(
+                n, 0, i0, i0, ni, luh, lul, yh, yl, rh, rl);
+            KERNEL_CHECK();
+        }
+    }
+}
+
 /*  The blocked drivers, batched. Same block sequence as the vendored
     single-vector ones, so each column sees the identical order. */
 void trsv_L_mrhs(
@@ -1196,6 +1474,10 @@ void trsv_L_mrhs(
     float const *bh, float const *bl, float *yh, float *yl,
     float *rh, float *rl) {
 
+    if (nrhs == 1 && trsv_single_rhs()) {
+        trsv_L_one(n, blk, ib, luh, lul, dlh, dll, bh, bl, yh, yl, rh, rl);
+        return;
+    }
     for (int i0 = 0; i0 < n; i0 += blk) {
         int const ni = (i0 + blk <= n)? blk : (n - i0);
         int const w  = ni * nrhs * 32;
@@ -1214,6 +1496,10 @@ void trsv_U_mrhs(
     float const *bh, float const *bl, float *yh, float *yl,
     float *rh, float *rl) {
 
+    if (nrhs == 1 && trsv_single_rhs()) {
+        trsv_U_one(n, blk, ib, luh, lul, duh, dul, bh, bl, yh, yl, rh, rl);
+        return;
+    }
     for (int i0 = ((n - 1) / blk) * blk; i0 >= 0; i0 -= blk) {
         int const ni = (i0 + blk <= n)? blk : (n - i0);
         int const w  = ni * nrhs * 32;
@@ -1522,6 +1808,80 @@ bool oii_factor(
     This runs after create, so the scratch for the unfused path is still
     allocated; folding that into create is a separate change (it is the term
     that makes the scratch scale with the depth). */
+/*  The panel, chosen the same way and for the same reason.
+
+    nsys at n = 16384, b = 256, k = 4 on an H100 NVL puts `k_panel_coop` at 48 %
+    of all GPU kernel time -- the largest single kernel, and about five times off
+    a memory-bound roof, which points at the grid.sync per column rather than the
+    arithmetic. FLAG=3 is the same cooperative panel with three barriers a column
+    instead of five: the panel kernel falls from 318.6 ms to 236.2 ms and the
+    whole factorization from 548.8 ms to 465.5 ms, a 1.18x that costs nothing,
+    because the factor it produces is bit-identical -- permutation and both DF32
+    words -- at b = 128 and b = 256.
+
+    The faster panels are not free. BLOCKFAC (1.52x) and PANEL2 (1.47x) both
+    change the factor, so they are verdict-gated rather than hash-gated and are
+    not selected here; L1A is 0.38x and stays off. As with the fused update, an
+    explicit setting from the caller wins and is captured on the first call. */
+void select_panel_variant() {
+    static bool captured     = false;
+    static bool caller_drives = false;
+    static std::string want;
+    if (!captured) {
+        /*  If the caller set any of the vendored panel switches, leave the whole
+            thing alone: those are tested for PRESENCE, not value, so PANEL2=0
+            would turn the two-level panel ON and there is no way for us to
+            express "off" on the caller's behalf. */
+        for (char const *v : {"PANEL2", "ASYNC", "BLOCKFAC", "FLAG", "L1A",
+                              "PANELPERSIST", "CALU", "MIX"})
+            if (std::getenv(v) != nullptr)
+                caller_drives = true;
+        char const *e = std::getenv("LPS_PANEL");
+        want = (e != nullptr)? e : "auto";
+        captured = true;
+    }
+    /*  The U12 block solve as a product with inverted 32 x 32 diagonal blocks
+        instead of a 64-row dependent chain per warp. Same pivots, max |L| = 1,
+        residual 9.1362e-08 against 9.1366e-08; 0 regressions on 288 depth
+        pairs; 8 ms of 372 at b = 256 and 19 ms of 588 at b = 128.
+        LPS_U12=chain keeps the chain. */
+    {
+        char const *u = std::getenv("LPS_U12");
+        if (u == nullptr || std::string(u) != "chain")
+            setenv("LPS_U12INV", "1", 1);
+    }
+    if (caller_drives || want == "off")
+        return;
+    if (want == "coop3") {
+        setenv("FLAG", "3", 1);
+        return;
+    }
+    if (want == "async") {
+        setenv("ASYNC", "1", 1);
+        return;
+    }
+    /*  auto, and "2level" explicitly. The panel is barrier-bound -- 2.5 us a
+        grid.sync against 6.9 us of work a column at n = 16384 -- and the
+        two-level panel halves the columns each synchronisation has to wait
+        for: 372 ms against 465 ms for the factorization. It keeps full-height
+        partial pivoting (max |L| = 1, the same growth factor and residual as
+        the default to four digits), but it is not bit-identical, so it was
+        gated on verdicts: 348 depth pairs over 58 cells, SuiteSparse included,
+        no regression and two cells that converge where they did not.
+        LPS_PANEL=coop3 is the bit-identical panel for a run that has to
+        reproduce an older factor. */
+    setenv("PANEL2", "1", 1);
+
+    /*  Each 64-column sub-block of that panel as one resident kernel with a
+        single grid barrier a column, instead of two launches a column. Same
+        operations in the same order, row swaps deferred to the end of the
+        sub-block, so the factor is bit-identical to the two-launch chain (72
+        of 72 cells over four families, odd sizes, b = 64/128/256). 328 ms
+        against 306 at n = 16384. LPS_PANEL=2level keeps the chain. */
+    if (want != "2level")
+        setenv("PANEL1B", "1", 1);
+}
+
 void select_fused_update(std::size_t const n, int const b) {
     static bool captured = false;
     static std::string caller_set;
