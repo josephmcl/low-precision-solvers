@@ -1841,14 +1841,24 @@ void select_panel_variant() {
         captured = true;
     }
     /*  The U12 block solve as a product with inverted 32 x 32 diagonal blocks
-        instead of a 64-row dependent chain per warp. Same pivots, max |L| = 1,
-        residual 9.1362e-08 against 9.1366e-08; 0 regressions on 288 depth
-        pairs; 8 ms of 372 at b = 256 and 19 ms of 588 at b = 128.
-        LPS_U12=chain keeps the chain. */
+        instead of a 64-row dependent chain per warp: 8 ms of 372 at b = 256
+        and 19 ms of 588 at b = 128, same pivots, max |L| = 1. Off by default.
+        It matched the chain on 2157 of 2160 depth pairs; the three that
+        differ are one matrix (random, n = 3000, b = 128, depth 2) whose
+        contraction and forward error are unchanged but whose backward error
+        stagnates at 1.9e-15 instead of 6.1e-16, across the acceptance level.
+        The gate counts that as a regression, so the chain stays the default
+        until the sliced block row replaces it. LPS_U12=inverse selects it. */
     {
         char const *u = std::getenv("LPS_U12");
-        if (u == nullptr || std::string(u) != "chain")
+        if (u != nullptr && std::string(u) == "inverse")
             setenv("LPS_U12INV", "1", 1);
+        /*  Experimental: the block row as U12 = S12 + G S12 with G = L11^-1 - I
+            sliced at the trailing depth ("sliced") or one level deeper. */
+        if (u != nullptr && std::string(u) == "sliced")
+            setenv("LPS_U12S", "0", 1);
+        if (u != nullptr && std::string(u) == "sliced+1")
+            setenv("LPS_U12S", "1", 1);
     }
     if (caller_drives || want == "off")
         return;
