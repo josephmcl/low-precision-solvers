@@ -1934,10 +1934,21 @@ void select_fused_update(std::size_t const n, int const b) {
         unsetenv("FUSE");
         return;
     }
-    if (b == 256 && n % 256 == 0)
-        setenv("FUSE", "5", 1);
-    else
+    /*  The 128-tile kernel is a different one on each architecture: wgmma on
+        sm_90a, tcgen05 from sm_100a (compiled only with -DTC5). Each compiles
+        to a stub that issues no product on a part that lacks the instruction,
+        so the choice is made from the device and never from the shape alone.
+        Without either, the warp-MMA kernels run everywhere. */
+    if (b == 256 && n % 256 == 0) {
+        if (int8lu_has_wgmma())
+            setenv("FUSE", "5", 1);
+        else if (int8lu_has_tcgen05())
+            setenv("FUSE", "6", 1);
+        else
+            setenv("FUSE", "4", 1);
+    } else {
         setenv("FUSE", "3", 1);
+    }
 }
 
 double factor(state *s) {

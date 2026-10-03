@@ -17,6 +17,14 @@ CUDA_ARCH ?= native
 # fp64-free combine, and the arm's TU needs the whole set.
 INCLUDE   := -Iinclude -Ivendor/nfp64gmresir/cuda
 
+# The 128-tile trailing kernel on sm_100a and up is the tcgen05 one, which
+# drains tensor memory through CUTLASS's cute headers. Point CUTLASS at a
+# checkout to build it; without it the library falls back to the warp-MMA
+# kernel on those parts (correct, slower).
+ifneq ($(CUTLASS),)
+INCLUDE   += -I$(CUTLASS)/include -DTC5
+endif
+
 # wgmma and TMA exist only under the arch-specific targets (compute_90a,
 # sm_100a); -arch=sm_90 drops them silently and takes a slower path. The
 # -gencode pair carries the 'a' suffix through both halves. NOTE native
