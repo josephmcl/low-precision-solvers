@@ -1946,6 +1946,9 @@ void select_fused_update(std::size_t const n, int const b) {
             setenv("FUSE", "6", 1);
         else
             setenv("FUSE", "4", 1);
+    } else if (b == 512 && n % 512 == 0 && int8lu_has_tcgen05() && INT8LU_TC5_KCHUNKS) {
+        /*  tcgen05 runs b = 512 as two K chunks of 256; wgmma has no such path */
+        setenv("FUSE", "6", 1);
     } else {
         setenv("FUSE", "3", 1);
     }

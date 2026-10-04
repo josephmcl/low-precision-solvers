@@ -1,3 +1,4 @@
+#include "common/matrix_market.h"
 #include "common/solver.h"
 #include "common/metrics.h"
 
@@ -49,6 +50,8 @@
 
 namespace {
 
+using harness::read_matrix_market;
+
 using harness::problem;
 
 struct row {
@@ -84,60 +87,6 @@ void emit(row const &r) {
               << r.rg_max << ',' << r.rg_median << '\n';
 }
 
-/*  Matrix Market reader, dense-ified.
-
-    SuiteSparse matrices arrive sparse and every method here is dense, so this
-    materialises them. That bounds what can be read to whatever fits n^2 fp64 —
-    around n = 30000 on a 33 GB card — which is the honest limit of using this
-    harness on real matrices, not a property of the methods.
-
-    Handles coordinate real/integer, general and symmetric. Pattern-only files
-    are rejected rather than filled with ones, which would silently change the
-    problem. */
-bool read_matrix_market(std::string const &path, std::vector<double> &a,
-                        std::size_t &n) {
-
-    std::ifstream in(path);
-    if (!in) { std::cerr << "[profile] cannot open " << path << "\n"; return false; }
-
-    std::string line;
-    if (!std::getline(in, line)) return false;
-
-    bool symmetric = line.find("symmetric") != std::string::npos;
-    bool skew      = line.find("skew") != std::string::npos;
-    if (line.find("pattern") != std::string::npos) {
-        std::cerr << "[profile] " << path << ": pattern-only, skipped "
-                     "(filling with ones would change the problem)\n";
-        return false;
-    }
-    if (line.find("coordinate") == std::string::npos) {
-        std::cerr << "[profile] " << path << ": only coordinate format\n";
-        return false;
-    }
-
-    while (std::getline(in, line))
-        if (!line.empty() && line[0] != '%') break;
-
-    std::size_t rows = 0, cols = 0, nnz = 0;
-    { std::istringstream hs(line); hs >> rows >> cols >> nnz; }
-    if (rows != cols) {
-        std::cerr << "[profile] " << path << ": not square (" << rows
-                  << "x" << cols << ")\n";
-        return false;
-    }
-
-    n = rows;
-    a.assign(n * n, 0.);
-    for (std::size_t e = 0; e != nnz; ++e) {
-        std::size_t i = 0, j = 0; double v = 0.;
-        if (!(in >> i >> j >> v)) break;
-        --i; --j;
-        a[i + j * n] = v;
-        if (symmetric && i != j) a[j + i * n] = v;
-        if (skew && i != j)      a[j + i * n] = -v;
-    }
-    return true;
-}
 
 std::string stem(std::string const &path) {
     std::size_t const s = path.find_last_of("/\\");
