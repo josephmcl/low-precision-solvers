@@ -1230,6 +1230,39 @@ __global__ void k_diag_apply_U_mrhs(
     like the S-rung itself it is a reordering that refinement absorbs, and it
     is gated on the iteration count and the verdict. LPS_TRSV_MRHS=1 selects
     the batched kernels for a comparison. */
+/*  Application precision of the single right-hand-side solves. The factor is
+    accurate to about 2^-(7.8 k) of itself, so at k <= 3 (about 23 bits) its hi
+    word already carries more than the factor holds: the solve can read hi only
+    and accumulate in fp32, which halves the factor traffic and drops the
+    two-word arithmetic. The residual and the update of x stay in DF32, so the
+    limiting accuracy is unchanged; only the contraction of the iteration can
+    move, and the probe measures the operator as applied. LPS_APPLY=df32|fp32
+    overrides the depth rule. */
+static bool g_apply_f32 = false;
+
+template <bool F32>
+__device__ __forceinline__ df32 trsv_mac(df32 acc, float ah, float al, float bh, float bl) {
+    if constexpr (F32)
+        return df_make(fmaf(ah, bh, acc.hi), 0.f);
+    else
+        return df_add_acc(acc, df_mul(df_make(ah, al), df_make(bh, bl)));
+}
+
+template <bool F32>
+__device__ __forceinline__ df32 trsv_warp_sum(df32 acc) {
+    for (int o = 16; o > 0; o >>= 1) {
+        float const oh = __shfl_down_sync(0xffffffffu, acc.hi, o);
+        if constexpr (F32) {
+            acc.hi += oh;
+        } else {
+            float const ol = __shfl_down_sync(0xffffffffu, acc.lo, o);
+            acc = df_add_acc(acc, df_make(oh, ol));
+        }
+    }
+    return acc;
+}
+
+template <bool F32>
 __global__ void k_trsv1_update(
     int const    n,
     int const    r0,
@@ -1251,14 +1284,9 @@ __global__ void k_trsv1_update(
 
     df32 acc = df_make(0.f, 0.f);
     for (int j = lane; j < nc; j += 32)
-        acc = df_add_acc(acc, df_mul(
-            df_make(luh[row + c0 + j], lul[row + c0 + j]),
-            df_make(yh[c0 + j], yl[c0 + j])));
-    for (int o = 16; o > 0; o >>= 1) {
-        float const oh = __shfl_down_sync(0xffffffffu, acc.hi, o);
-        float const ol = __shfl_down_sync(0xffffffffu, acc.lo, o);
-        acc = df_add_acc(acc, df_make(oh, ol));
-    }
+        acc = trsv_mac<F32>(acc, luh[row + c0 + j], F32? 0.f : lul[row + c0 + j],
+                            yh[c0 + j], F32? 0.f : yl[c0 + j]);
+    acc = trsv_warp_sum<F32>(acc);
     if (lane == 0) {
         df32 const v = df_sub_acc(df_make(rh[r0 + gw], rl[r0 + gw]), acc);
         rh[r0 + gw] = v.hi;
@@ -1266,6 +1294,7 @@ __global__ void k_trsv1_update(
     }
 }
 
+template <bool F32>
 __global__ void k_trsv1_group_L(
     int const    n,
     int const    i0,
@@ -1303,14 +1332,9 @@ __global__ void k_trsv1_group_L(
             for (int row = w; row < sw; row += nw) {
                 df32 acc = df_make(0.f, 0.f);
                 for (int q = lane; q < sw; q += 32)
-                    acc = df_add_acc(acc, df_mul(
-                        df_make(mh[row * ib + q], ml[row * ib + q]),
-                        df_make(rsh[sb + q], rsl[sb + q])));
-                for (int o = 16; o > 0; o >>= 1) {
-                    float const oh = __shfl_down_sync(0xffffffffu, acc.hi, o);
-                    float const ol = __shfl_down_sync(0xffffffffu, acc.lo, o);
-                    acc = df_add_acc(acc, df_make(oh, ol));
-                }
+                    acc = trsv_mac<F32>(acc, mh[row * ib + q], F32? 0.f : ml[row * ib + q],
+                                        rsh[sb + q], F32? 0.f : rsl[sb + q]);
+                acc = trsv_warp_sum<F32>(acc);
                 if (lane == 0) {
                     ysh[sb + row] = acc.hi;
                     ysl[sb + row] = acc.lo;
@@ -1326,14 +1350,9 @@ __global__ void k_trsv1_group_L(
                 static_cast<std::size_t>(i0 + row) * n + (i0 + sb);
             df32 acc = df_make(0.f, 0.f);
             for (int j = lane; j < sw; j += 32)
-                acc = df_add_acc(acc, df_mul(
-                    df_make(luh[base + j], lul[base + j]),
-                    df_make(ysh[sb + j], ysl[sb + j])));
-            for (int o = 16; o > 0; o >>= 1) {
-                float const oh = __shfl_down_sync(0xffffffffu, acc.hi, o);
-                float const ol = __shfl_down_sync(0xffffffffu, acc.lo, o);
-                acc = df_add_acc(acc, df_make(oh, ol));
-            }
+                acc = trsv_mac<F32>(acc, luh[base + j], F32? 0.f : lul[base + j],
+                                    ysh[sb + j], F32? 0.f : ysl[sb + j]);
+            acc = trsv_warp_sum<F32>(acc);
             if (lane == 0) {
                 df32 const v = df_sub_acc(df_make(rsh[row], rsl[row]), acc);
                 rsh[row] = v.hi;
@@ -1348,6 +1367,7 @@ __global__ void k_trsv1_group_L(
     }
 }
 
+template <bool F32>
 __global__ void k_trsv1_group_U(
     int const    n,
     int const    i0,
@@ -1385,14 +1405,9 @@ __global__ void k_trsv1_group_U(
             for (int row = w; row < sw; row += nw) {
                 df32 acc = df_make(0.f, 0.f);
                 for (int q = lane; q < sw; q += 32)
-                    acc = df_add_acc(acc, df_mul(
-                        df_make(mh[row * ib + q], ml[row * ib + q]),
-                        df_make(rsh[sb + q], rsl[sb + q])));
-                for (int o = 16; o > 0; o >>= 1) {
-                    float const oh = __shfl_down_sync(0xffffffffu, acc.hi, o);
-                    float const ol = __shfl_down_sync(0xffffffffu, acc.lo, o);
-                    acc = df_add_acc(acc, df_make(oh, ol));
-                }
+                    acc = trsv_mac<F32>(acc, mh[row * ib + q], F32? 0.f : ml[row * ib + q],
+                                        rsh[sb + q], F32? 0.f : rsl[sb + q]);
+                acc = trsv_warp_sum<F32>(acc);
                 if (lane == 0) {
                     ysh[sb + row] = acc.hi;
                     ysl[sb + row] = acc.lo;
@@ -1406,14 +1421,9 @@ __global__ void k_trsv1_group_U(
                 static_cast<std::size_t>(i0 + row) * n + (i0 + sb);
             df32 acc = df_make(0.f, 0.f);
             for (int j = lane; j < sw; j += 32)
-                acc = df_add_acc(acc, df_mul(
-                    df_make(luh[base + j], lul[base + j]),
-                    df_make(ysh[sb + j], ysl[sb + j])));
-            for (int o = 16; o > 0; o >>= 1) {
-                float const oh = __shfl_down_sync(0xffffffffu, acc.hi, o);
-                float const ol = __shfl_down_sync(0xffffffffu, acc.lo, o);
-                acc = df_add_acc(acc, df_make(oh, ol));
-            }
+                acc = trsv_mac<F32>(acc, luh[base + j], F32? 0.f : lul[base + j],
+                                    ysh[sb + j], F32? 0.f : ysl[sb + j]);
+            acc = trsv_warp_sum<F32>(acc);
             if (lane == 0) {
                 df32 const v = df_sub_acc(df_make(rsh[row], rsl[row]), acc);
                 rsh[row] = v.hi;
@@ -1445,13 +1455,17 @@ void trsv_L_one(
                                cudaMemcpyDeviceToDevice, 0));
     for (int i0 = 0; i0 < n; i0 += blk) {
         int const ni = (i0 + blk <= n)? blk : (n - i0);
-        k_trsv1_group_L<<<1, 1024>>>(n, i0, ni, ib, luh, lul, dlh, dll,
-                                    rh, rl, yh, yl);
+        if (g_apply_f32)
+            k_trsv1_group_L<true><<<1, 1024>>>(n, i0, ni, ib, luh, lul, dlh, dll, rh, rl, yh, yl);
+        else
+            k_trsv1_group_L<false><<<1, 1024>>>(n, i0, ni, ib, luh, lul, dlh, dll, rh, rl, yh, yl);
         KERNEL_CHECK();
         int const nr = n - i0 - ni;
         if (nr > 0) {
-            k_trsv1_update<<<(nr * 32 + 255) / 256, 256>>>(
-                n, i0 + ni, nr, i0, ni, luh, lul, yh, yl, rh, rl);
+            if (g_apply_f32)
+                k_trsv1_update<true><<<(nr * 32 + 255) / 256, 256>>>(n, i0 + ni, nr, i0, ni, luh, lul, yh, yl, rh, rl);
+            else
+                k_trsv1_update<false><<<(nr * 32 + 255) / 256, 256>>>(n, i0 + ni, nr, i0, ni, luh, lul, yh, yl, rh, rl);
             KERNEL_CHECK();
         }
     }
@@ -1469,12 +1483,16 @@ void trsv_U_one(
                                cudaMemcpyDeviceToDevice, 0));
     for (int i0 = ((n - 1) / blk) * blk; i0 >= 0; i0 -= blk) {
         int const ni = (i0 + blk <= n)? blk : (n - i0);
-        k_trsv1_group_U<<<1, 1024>>>(n, i0, ni, ib, luh, lul, duh, dul,
-                                    rh, rl, yh, yl);
+        if (g_apply_f32)
+            k_trsv1_group_U<true><<<1, 1024>>>(n, i0, ni, ib, luh, lul, duh, dul, rh, rl, yh, yl);
+        else
+            k_trsv1_group_U<false><<<1, 1024>>>(n, i0, ni, ib, luh, lul, duh, dul, rh, rl, yh, yl);
         KERNEL_CHECK();
         if (i0 > 0) {
-            k_trsv1_update<<<(i0 * 32 + 255) / 256, 256>>>(
-                n, 0, i0, i0, ni, luh, lul, yh, yl, rh, rl);
+            if (g_apply_f32)
+                k_trsv1_update<true><<<(i0 * 32 + 255) / 256, 256>>>(n, 0, i0, i0, ni, luh, lul, yh, yl, rh, rl);
+            else
+                k_trsv1_update<false><<<(i0 * 32 + 255) / 256, 256>>>(n, 0, i0, i0, ni, luh, lul, yh, yl, rh, rl);
             KERNEL_CHECK();
         }
     }
@@ -1529,11 +1547,22 @@ void trsv_U_mrhs(
 /*  One application of the left preconditioner B0^-1 = U^-1 L^-1 P to k
     columns: exactly what the stationary path does per step, reused so
     the two solvers share a preconditioner rather than each having one. */
+/*  fp32 application at depth <= 3, DF32 above; LPS_APPLY=fp32|df32 forces one. */
+void set_apply_precision(state const *s) {
+    static int forced = -2;
+    if (forced == -2) {
+        char const *e = std::getenv("LPS_APPLY");
+        forced = (e == nullptr)? -1 : (std::string(e) == "fp32")? 1 : (std::string(e) == "df32")? 0 : -1;
+    }
+    g_apply_f32 = (forced >= 0)? (forced == 1) : (s->kfac <= 3);
+}
+
 void apply_precond(
     state *s, int const n, int const nrhs, int const ld,
     float *inh, float *inl,          /* consumed, gathered in place */
     float *outh, float *outl,
     float *t1h, float *t1l) {
+    set_apply_precision(s);
 
     int const T = launch::BLOCK_SIZE;
     int const g = (n + T - 1) / T;
@@ -2071,6 +2100,7 @@ double solve(
 
     if (s == nullptr)
         return 0.;
+    set_apply_precision(s);
     if (inner_j < 0 || inner_j > 8) {
         std::fprintf(stderr, "[qlu] inner_j=%d out of range; the "
                              "least squares is sized for j <= 8\n",
@@ -2173,9 +2203,17 @@ double solve(
     static int trace_env = -1;
     if (trace_env < 0) {
         char const *e = std::getenv("LPS_TRACE");
-        trace_env = (e != nullptr && e[0] == '1')? 1 : 0;
+        /*  1: print and run every step (exits suppressed); 2: print only */
+        trace_env = (e == nullptr)? 0 : (e[0] == '1')? 1 : (e[0] == '2')? 2 : 0;
     }
-    int trace = trace_env;
+    int trace = (trace_env == 1)? 1 : 0;
+    bool const tprint = trace_env != 0;
+    static int stop_env = -1;
+    if (stop_env < 0) {
+        char const *e = std::getenv("LPS_STOP");
+        stop_env = (e != nullptr && std::string(e) == "stall")? 0 : 1;
+    }
+    bool const stop_bound = stop_env == 1;
 
     /*  Per-call forced iteration count, for measuring STOPPING
         EFFICIENCY: the step at which ferr first reaches its floor,
@@ -2267,14 +2305,14 @@ double solve(
                              + static_cast<double>(b_norm[c]);
             double const rel = static_cast<double>(r_norm)
                              / (den > 0.? den : 1.);
-            if (trace && c == 0)
-                std::printf("[trace] it %2zu  rel %.6e\n", it, rel);
             /*  The correction-norm test, on the previous iteration's
                 correction. tol = 4 u_ff: below that the correction is
                 at the carrier's own noise level and further steps move
                 nothing. */
             double const drel = (d_prev[c] > 0. && x_n > 0.f)?
                                 d_prev[c] / static_cast<double>(x_n) : 1.;
+            if ((trace || tprint) && c == 0)
+                std::printf("[trace] it %2zu  rel %.6e  drel %.3e  rho %.3e  small %d  stalled %d\n", it, rel, drel, rho_est[c], small[c], stalled[c]);
 
             /*  A small correction does not imply a small error.
                 e_k = (I - E) d_k, since d_k = (I+M) e_k and
@@ -2338,6 +2376,21 @@ double solve(
                 continue;
             }
 
+            /*  The a-posteriori bound of a contraction: with rho the ratio of
+                the last two corrections, ||x - x_it|| <= rho/(1-rho) ||d_{it-1}||.
+                Once that is below the carrier's resolution and the residual
+                certifies, a further step changes nothing. The corrections
+                themselves settle at about cond(A,x) u_ff -- 7 u_ff on the
+                diagonally dominant timing matrix -- which is above the 4 u_ff
+                test below, so without this a solve that reached its floor in
+                two corrections ran two more and ended on the stall rule.
+                LPS_STOP=stall keeps the earlier behaviour. */
+            if (stop_bound && it > 2 && resid_ok && rho_est[c] > 0. && rho_est[c] < 0.5
+                && rho_est[c] / (1. - rho_est[c]) * drel <= 4. * 0x1p-49 && !trace) {
+                done[c] = 1;
+                certified[c] = 1;
+                continue;
+            }
             if (it > 1 && small[c] >= 1 && (warm_ok || small[c] >= 2)) {
                 if (!trace) {
                     /*  the correction is at the carrier's noise: nothing

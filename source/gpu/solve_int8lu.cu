@@ -24,12 +24,13 @@ void factor_int8lu(state &st, problem &prob) {
     /*  Allocation before the stopwatch: an allocator call inside a timed
         region is charged to the arithmetic, and this one is ~16n^2. */
     /*  The S-rung the campaign and the closed loop use: the largest of
-        64/32/16 that divides n. This arm used to be created without it, so
+        128/64/32/16 that divides n (128 is 2.5 ms a solve faster than 64 at
+        n = 16384; 256 gains nothing more). This arm used to be created without it, so
         the registry timed the unblocked solve -- 61 ms a refinement step at
         n = 16384 against 23 ms with it -- and the baseline table charged the
         method for a solve nothing else runs. */
     int srung = 0;
-    for (int ib : {64, 32, 16})
+    for (int ib : {128, 64, 32, 16})
         if (prob.n % static_cast<std::size_t>(ib) == 0) { srung = ib; break; }
     st.arm        = qlu::create(prob.n, b, kfac, qlu::kernel::sliced, srung);
     st.storage_n2 = qlu::STORAGE_N2;
