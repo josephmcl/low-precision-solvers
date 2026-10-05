@@ -1,6 +1,7 @@
 #include "common/solver.h"
 
 #include "common/qlu.h"
+#include "common/tuning.h"
 
 /*  Registry bridge for the INT-sliced arm. The arm itself lives behind
     qlu.h because exactly one translation unit may include the vendor
@@ -64,9 +65,15 @@ void solve_int8lu(
     if (st.arm == nullptr)
         return;
 
+    /*  GMRES degree of the refinement: 0 is stationary refinement (the
+        default), m in 2..8 is GMRES(m) (tuning key int8lu.gmres, or
+        LPS_INT8LU_GMRES). */
+    int const inner_j = tuning::current().get("int8lu.gmres", 0);
     std::size_t iterations = 0;
-    st.solve_ms     = qlu::solve(st.arm, d_x, d_b, prob.k, &iterations);
+    st.solve_ms     = qlu::solve(st.arm, d_x, d_b, prob.k, &iterations, inner_j);
     st.n_iterations = iterations;
+    st.status = qlu::last_converged(st.arm)? 1 : 2;
+    st.raw_iterations = static_cast<int>(iterations);
 }
 
 } /* namespace solver */

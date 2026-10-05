@@ -236,9 +236,37 @@ typedef int (*step_hook_fn)(void *ctx, std::size_t it, std::size_t k,
 void set_step_hook(step_hook_fn fn, void *ctx);
 bool last_refactor_requested(state const *s);
 
+/*  Convergence trace. With a sink installed, solve() reports every outer
+    iteration of every column after its stopping test, and every GMRES inner
+    step. The sink only observes: the iterates and the exits are those of an
+    untraced solve.
+
+    Row `it` describes x_it, the iterate after `it` corrections. correction_inf
+    is the norm of the correction that produced it and correction_ratio its
+    ratio to the one before; stop_quantity is rho / (1 - rho) * ||d|| / ||x||
+    with rho that ratio, NaN where rho is not in (0, 1). fired is the exit
+    taken at this iteration. */
+enum class stop_test : int { none = 0, contraction_bound = 1, small_correction = 2, stall = 3, nonfinite = 4 };
+struct trace_row {
+    std::size_t  it = 0, column = 0;
+    double       residual_inf = 0.;      /* ||b - A x_it||_inf, the DF32 residual  */
+    double       x_inf = 0., a_inf = 0., b_inf = 0.;
+    double       normalized_residual = 0.;
+    double       correction_inf = 0., correction_ratio = 0., stop_quantity = 0.;
+    bool         residual_ok = false;
+    stop_test    fired = stop_test::none;
+    float const *d_xh = nullptr, *d_xl = nullptr;   /* x_it on the device */
+};
+typedef void (*trace_outer_fn)(void *ctx, trace_row const &row);
+/*  The GMRES residual || beta e_1 - H_j y_j || / beta after inner step j of
+    the cycle that follows outer iteration `it`. */
+typedef void (*trace_inner_fn)(void *ctx, std::size_t it, std::size_t column,
+                               int step, double relative_residual);
+void set_trace_sink(trace_outer_fn outer, trace_inner_fn inner, void *ctx);
+
 /*  Whether the last solve's answer is certified: every column stopped with
     its normalised residual ||b - Ax|| / (||A|| ||x|| + ||b||) (infinity
-    norms, formed in DF32) at or below 8 u_ff. A solve that stalled, ran out
+    norms, formed in DF32) at or below max(8, sqrt(n) / 8) u_ff. A solve that stalled, ran out
     of iterations or diverged above that level returns false, and its X is
     not a solution. last_residual is the worst column's value. */
 bool last_converged(state const *s);

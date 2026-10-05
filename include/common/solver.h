@@ -77,6 +77,13 @@ struct state {
     double      total_ms     = 0.;
     std::size_t n_iterations = 0;
 
+    /*  What the method says about its own result: 0 not reported, 1 converged
+        by its own test, 2 stopped without converging, 3 fell back (vendor IRS
+        finishing in its main precision). raw_iterations is the method's count
+        as returned, sign included (IRS reports a fallback as negative). */
+    int         status         = 0;
+    int         raw_iterations = 0;
+
     /*  True when the method reported a factor/solve breakdown. The reporter
         prints "--" in those columns otherwise rather than a zero that would
         read as "free". */

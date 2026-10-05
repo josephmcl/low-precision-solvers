@@ -1,4 +1,6 @@
 #include "common/solver.h"
+#include <cstdlib>
+#include <string>
 
 /*  Vendor baseline: cusolverDnIRSXgesv.
 
@@ -38,8 +40,17 @@ void factor_solve_vendor_irs(
 
     CUSOLVER_CHECK(cusolverDnIRSParamsSetSolverMainPrecision(
         params, CUSOLVER_R_64F));
+    /*  The inner precision: FP32 unless LPS_IRS_PRECISION names another
+        (16F, 16BF, TF32, 32F), for the conditioning sweep against MPIR. */
+    cusolverPrecType_t lowest = CUSOLVER_R_32F;
+    if (char const *e = std::getenv("LPS_IRS_PRECISION")) {
+        std::string const p(e);
+        if (p == "16F") lowest = CUSOLVER_R_16F;
+        else if (p == "16BF") lowest = CUSOLVER_R_16BF;
+        else if (p == "TF32") lowest = CUSOLVER_R_TF32;
+    }
     CUSOLVER_CHECK(cusolverDnIRSParamsSetSolverLowestPrecision(
-        params, CUSOLVER_R_32F));
+        params, lowest));
     CUSOLVER_CHECK(cusolverDnIRSParamsSetRefinementSolver(
         params, CUSOLVER_IRS_REFINE_CLASSICAL));
 
@@ -93,6 +104,8 @@ void factor_solve_vendor_irs(
         a non-converged run cannot be read as a fast one. */
     st.n_iterations = (n_iterations > 0)?
         static_cast<std::size_t>(n_iterations) : 0;
+    st.raw_iterations = n_iterations;
+    st.status = (n_iterations > 0)? 1 : 3;
 
     CUSOLVER_CHECK(cusolverDnIRSParamsDestroy(params));
     CUSOLVER_CHECK(cusolverDnIRSInfosDestroy(infos));

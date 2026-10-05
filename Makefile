@@ -111,6 +111,7 @@ COMMON    := \
 	$(COM_OBJ)/ozaki.o       \
 	$(COM_OBJ)/trsm.o        \
 	$(COM_OBJ)/solver.o      \
+	$(COM_OBJ)/rhs_reference.o \
 	$(OBJ_DIR)/solve_direct.o \
 	$(OBJ_DIR)/solve_split_mpir.o \
 	$(OBJ_DIR)/solve_rir.o \
@@ -148,6 +149,8 @@ FDUMP_MAIN  := $(TOBJ_DIR)/main_factordump.o
 FPIV_MAIN   := $(TOBJ_DIR)/main_forcepiv.o
 A4_MAIN     := $(TOBJ_DIR)/main_a4.o
 A5_MAIN     := $(TOBJ_DIR)/main_a5.o
+QGRID_MAIN  := $(TOBJ_DIR)/main_qgrid.o
+LUDUMP_MAIN := $(TOBJ_DIR)/main_ludump.o
 C4_MAIN     := $(TOBJ_DIR)/main_c4.o
 SSTEP_MAIN  := $(TOBJ_DIR)/main_solvestep.o
 A2_MAIN     := $(TOBJ_DIR)/main_a2.o
@@ -173,7 +176,7 @@ all: $(BIN_DIR)/lps-sweep $(BIN_DIR)/lps-probe $(BIN_DIR)/lps-ozaki-test \
      $(BIN_DIR)/lps-asymdepth $(BIN_DIR)/lps-factordump \
      $(BIN_DIR)/lps-forcepiv $(BIN_DIR)/lps-a4 $(BIN_DIR)/lps-a5 $(BIN_DIR)/lps-c4 \
      $(BIN_DIR)/lps-solvestep $(BIN_DIR)/lps-a2 \
-     $(BIN_DIR)/lps-martingale \
+     $(BIN_DIR)/lps-martingale $(BIN_DIR)/lps-qgrid $(BIN_DIR)/lps-ludump \
      $(BIN_DIR)/lps-campaign
 
 $(BIN_DIR)/lps-sweep: $(COMMON) $(SWEEP_MAIN) | $(BIN_DIR)
@@ -275,6 +278,12 @@ $(BIN_DIR)/lps-a4: $(COMMON) $(A4_MAIN) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
 
 $(BIN_DIR)/lps-a5: $(COMMON) $(A5_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN_DIR)/lps-qgrid: $(COMMON) $(QGRID_MAIN) | $(BIN_DIR)
+	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
+
+$(BIN_DIR)/lps-ludump: $(LUDUMP_MAIN) | $(BIN_DIR)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDLIBS)
 
 $(BIN_DIR)/lps-c4: $(COMMON) $(C4_MAIN) | $(BIN_DIR)

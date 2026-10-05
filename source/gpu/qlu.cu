@@ -72,6 +72,22 @@ __global__ void add_correction_kernel(
     x_lo[i] = r.lo;
 }
 
+/*  out = x - y, the leading word of the DF32 difference. */
+__global__ void difference_kernel(
+    int const    n,
+    float const *x_hi,
+    float const *x_lo,
+    float const *y_hi,
+    float const *y_lo,
+    float       *out) {
+
+    int const i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n)
+        return;
+
+    out[i] = df_add(df_make(x_hi[i], x_lo[i]), df_make(-y_hi[i], -y_lo[i])).hi;
+}
+
 /*  max |v|, as atomicMax on the float bit pattern. Valid because the values
     compared are magnitudes: IEEE ordering is monotonic on non-negatives. */
 /*  Inf-norm of the DF32 operator, one block per row.
@@ -92,6 +108,11 @@ static int g_force_iters = 0;
     bit-exact gate (bin/lps-solvestep) is what says so. */
 static qlu::step_hook_fn g_step_hook = nullptr;
 static void             *g_step_hook_ctx = nullptr;
+
+static qlu::trace_outer_fn g_trace_outer = nullptr;
+static qlu::trace_inner_fn g_trace_inner = nullptr;
+static void               *g_trace_ctx = nullptr;
+static std::size_t         g_trace_it = 0;
 
 __global__ void k_inf_norm_rows(int const n, float const *ah,
                                 float const *al, float *out) {
@@ -217,6 +238,10 @@ struct state {
     float *d_zh = nullptr, *d_zl = nullptr;
     float *d_th = nullptr, *d_tl = nullptr;
     float *d_nrm = nullptr;
+    /*  The solve's per-column norms, three blocks of k: residual, iterate,
+        correction. Grown on demand to the largest k seen. */
+    float      *d_nrmv   = nullptr;
+    std::size_t nrmv_cap = 0;
     double a_inf  = 0.;    /* ||A||_inf, for a conditioning-free metric */
     double last_rho = 0.;  /* ||d_{k+1}||/||d_k||, the rho(M) estimate */
     int    last_diverged = 0;
@@ -1236,8 +1261,9 @@ __global__ void k_diag_apply_U_mrhs(
     and accumulate in fp32, which halves the factor traffic and drops the
     two-word arithmetic. The residual and the update of x stay in DF32, so the
     limiting accuracy is unchanged; only the contraction of the iteration can
-    move, and the probe measures the operator as applied. LPS_APPLY=df32|fp32
-    overrides the depth rule. */
+    move, and the probe measures the operator as applied. Off by default
+    (LPS_APPLY=fp32 opts in): the a priori certificate does not count the
+    application error yet. */
 static bool g_apply_f32 = false;
 
 template <bool F32>
@@ -1547,14 +1573,16 @@ void trsv_U_mrhs(
 /*  One application of the left preconditioner B0^-1 = U^-1 L^-1 P to k
     columns: exactly what the stationary path does per step, reused so
     the two solvers share a preconditioner rather than each having one. */
-/*  fp32 application at depth <= 3, DF32 above; LPS_APPLY=fp32|df32 forces one. */
+/*  DF32 application by default. LPS_APPLY=fp32 opts in to fp32 application,
+    which is honoured only at depth <= 3: the a priori certificate does not
+    yet count the application error. */
 void set_apply_precision(state const *s) {
-    static int forced = -2;
-    if (forced == -2) {
+    static int want_f32 = -1;
+    if (want_f32 < 0) {
         char const *e = std::getenv("LPS_APPLY");
-        forced = (e == nullptr)? -1 : (std::string(e) == "fp32")? 1 : (std::string(e) == "df32")? 0 : -1;
+        want_f32 = (e != nullptr && std::string(e) == "fp32")? 1 : 0;
     }
-    g_apply_f32 = (forced >= 0)? (forced == 1) : (s->kfac <= 3);
+    g_apply_f32 = want_f32 == 1 && s->kfac <= 3;
 }
 
 void apply_precond(
@@ -1625,6 +1653,47 @@ bool ensure_gmres(state *s, int const j, std::size_t const k) {
     s->gm_j = j;
     s->gm_k = k;
     return true;
+}
+
+/*  The residual of the least squares after each Arnoldi step, relative to
+    beta: the same Givens sweep as k_gmres_lsq, on the host in double. */
+void trace_arnoldi(state *s, int const j, int const nrhs) {
+
+    std::size_t const per = static_cast<std::size_t>(j + 1) * j;
+    std::vector<float> hh(nrhs * per), hl(nrhs * per), bh(nrhs);
+    std::vector<int>   keff(nrhs);
+    CUDA_CHECK(cudaMemcpy(hh.data(), s->gm_hh, hh.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hl.data(), s->gm_hl, hl.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(bh.data(), s->gm_bh, bh.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(keff.data(), s->gm_keff, keff.size() * sizeof(int), cudaMemcpyDeviceToHost));
+
+    for (int c = 0; c != nrhs; ++c) {
+        int const k = std::min(keff[c], j);
+        if (!(bh[c] > 0.f))
+            continue;
+        double r[9][8], g[9] = {1.};
+        for (int a = 0; a <= k; ++a)
+            for (int b = 0; b < k; ++b) {
+                std::size_t const o = c * per + static_cast<std::size_t>(b) * (j + 1) + a;
+                r[a][b] = static_cast<double>(hh[o]) + static_cast<double>(hl[o]);
+            }
+        for (int b = 0; b < k; ++b) {
+            double const d = std::hypot(r[b][b], r[b + 1][b]);
+            if (d > 0.) {
+                double const cs = r[b][b] / d, sn = r[b + 1][b] / d;
+                for (int q = b; q < k; ++q) {
+                    double const t1 = r[b][q], t2 = r[b + 1][q];
+                    r[b][q]     = cs * t1 + sn * t2;
+                    r[b + 1][q] = cs * t2 - sn * t1;
+                }
+                g[b + 1] = -sn * g[b];
+                g[b]     = cs * g[b];
+            } else {
+                g[b + 1] = 0.;
+            }
+            g_trace_inner(g_trace_ctx, g_trace_it, static_cast<std::size_t>(c), b + 1, std::fabs(g[b + 1]));
+        }
+    }
 }
 
 /*  j Arnoldi steps on Op(v) = B0^-1 (A v), starting from the normalized
@@ -1724,6 +1793,9 @@ void gmres_inner(
                                        vn_h, vn_l, s->gm_keff);
         KERNEL_CHECK();
     }
+
+    if (g_trace_inner != nullptr)
+        trace_arnoldi(s, j, nrhs);
 
     k_gmres_lsq<<<gc, 256>>>(j, nrhs, s->gm_hh, s->gm_hl,
                              s->gm_bh, s->gm_bl, s->gm_keff,
@@ -2215,6 +2287,21 @@ double solve(
     }
     bool const stop_bound = stop_env == 1;
 
+    /*  The residual test's tolerance: max(8, sqrt(n) / 8) u_ff. The rounding
+        error of the DF32 residual grows with the length of its sums, like
+        sqrt(n) in the probabilistic analyses (Higham and Mary 2019; Connolly,
+        Higham and Mary 2021): its floor is 4 u_ff at n = 8192 and 10 to 12
+        u_ff at n = 32768 on the log-uniform and arithmetic families, where a
+        fixed 8 u_ff never certifies a solve whose backward error is 2e-16.
+        The tolerance is 8 u_ff for every n <= 4096. LPS_RESID_TOL=fixed keeps
+        8 u_ff at every size. */
+    static int tol_env = -1;
+    if (tol_env < 0) {
+        char const *e = std::getenv("LPS_RESID_TOL");
+        tol_env = (e != nullptr && std::string(e) == "fixed")? 0 : 1;
+    }
+    double const resid_tol = ((tol_env == 1)? std::max(8., std::sqrt(static_cast<double>(n)) / 8.) : 8.) * 0x1p-49;
+
     /*  Per-call forced iteration count, for measuring STOPPING
         EFFICIENCY: the step at which ferr first reaches its floor,
         against the step the rule actually fires. Without that number a
@@ -2246,6 +2333,67 @@ double solve(
     std::vector<double>      rel_last(k, 1.);
     std::vector<char>        certified(k, 0);
 
+    /*  One read of the norms an iteration. The residual and iterate norms of
+        every active column and the previous iteration's correction norms come
+        back in a single copy; the correction norm is only used by the next
+        stopping test, so it is folded in there, in the order it always was
+        (correction ratio, divergence count, d_prev), before that test. The
+        values and every decision are the same as reading each one as soon as
+        it was formed; the host waits once an iteration instead of three times
+        a column. */
+    if (s->nrmv_cap < 3 * k) {
+        s->d_nrmv   = static_cast<float *>(s->acquire(3 * k * sizeof(float)));
+        s->nrmv_cap = 3 * k;
+    }
+    float *const d_rn = s->d_nrmv, *const d_xn = s->d_nrmv + k, *const d_dn = s->d_nrmv + 2 * k;
+    std::vector<float>       hn(3 * k, 0.f);
+    std::vector<char>        pending(k, 0);
+    std::vector<std::size_t> pending_it(k, 0);
+    auto take_correction_norm = [&](std::size_t const c, float const dn) {
+        double const dcur = static_cast<double>(dn);
+        if (d_prev[c] > 0. && dcur > 0.) {
+            double const ratio = dcur / d_prev[c];
+            rho_est[c] = ratio;
+            /*  RECORD, do not stop: see the comment where the correction
+                is applied. The margin is 5 percent, well inside the 1.10
+                the diverging cell shows. */
+            if (ratio > 1.05) {
+                if (++growing[c] >= 2 && pending_it[c] > 3)
+                    diverged[c] = 1;
+            } else {
+                growing[c] = 0;
+            }
+        }
+        d_prev[c] = dcur;
+        pending[c] = 0;
+    };
+
+    auto report = [&](std::size_t const it, std::size_t const c, float const r_norm, float const x_n,
+                      double const rel, double const drel, bool const resid_ok, stop_test const fired) {
+        if (g_trace_outer == nullptr)
+            return;
+        trace_row row;
+        row.it = it; row.column = c;
+        row.residual_inf = r_norm; row.x_inf = x_n; row.a_inf = s->a_inf; row.b_inf = b_norm[c];
+        row.normalized_residual = rel;
+        row.correction_inf = d_prev[c]; row.correction_ratio = rho_est[c];
+        row.stop_quantity = (rho_est[c] > 0. && rho_est[c] < 1.)? rho_est[c] / (1. - rho_est[c]) * drel : std::nan("");
+        row.residual_ok = resid_ok; row.fired = fired;
+        row.d_xh = s->d_xh + c * ld; row.d_xl = s->d_xl + c * ld;
+        g_trace_outer(g_trace_ctx, row);
+    };
+
+    /*  The GMRES update goes straight into x, so its correction norm is
+        taken from the iterate before and after; the stopping tests then see
+        a GMRES cycle's correction as they see a stationary step's.
+        LPS_GMRES_STOP=stall leaves them blind to it, as they were: the
+        solve then ends on the stall rule alone. */
+    static int gmres_dnorm = -1;
+    if (gmres_dnorm < 0) {
+        char const *e = std::getenv("LPS_GMRES_STOP");
+        gmres_dnorm = (e != nullptr && std::string(e) == "stall")? 0 : 1;
+    }
+
     for (std::size_t it = 0; it != cap; ++it) {
 
         for (std::size_t c = 0; c != k; ++c) {
@@ -2257,16 +2405,24 @@ double solve(
                 s->d_rh + c * ld, s->d_rl + c * ld)));
         }
 
+        CUDA_CHECK(cudaMemsetAsync(s->d_nrmv, 0, 2 * k * sizeof(float), 0));
+        for (std::size_t c = 0; c != k; ++c) {
+            if (done[c])
+                continue;
+            LAUNCH((max_abs_kernel<<<g, T>>>(n, s->d_rh + c * ld, d_rn + c)));
+            LAUNCH((max_abs_kernel<<<g, T>>>(n, s->d_xh + c * ld, d_xn + c)));
+        }
+        CUDA_CHECK(cudaMemcpy(hn.data(), s->d_nrmv, 3 * k * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+        for (std::size_t c = 0; c != k; ++c)
+            if (pending[c])
+                take_correction_norm(c, hn[2 * k + c]);
+
         std::size_t n_active = 0;
         for (std::size_t c = 0; c != k; ++c) {
             if (done[c])
                 continue;
-            CUDA_CHECK(cudaMemset(s->d_nrm, 0, sizeof(float)));
-            LAUNCH((max_abs_kernel<<<g, T>>>(n, s->d_rh + c * ld,
-                                             s->d_nrm)));
-            float r_norm = 0.f;
-            CUDA_CHECK(cudaMemcpy(&r_norm, s->d_nrm, sizeof(float),
-                                  cudaMemcpyDeviceToHost));
+            float const r_norm = hn[c];
             /*  STOPPING IS ON THE CORRECTION NORM, not the residual.
 
                 Both residual normalisations fail, in opposite
@@ -2295,12 +2451,7 @@ double solve(
                 ||A|| ||x|| term is the magnitude the residual evaluation
                 cancels against, so this floors at u_ff rather than at
                 u_ff ||A|| ||x|| / ||b||. */
-            CUDA_CHECK(cudaMemset(s->d_nrm, 0, sizeof(float)));
-            LAUNCH((max_abs_kernel<<<g, T>>>(n, s->d_xh + c * ld,
-                                             s->d_nrm)));
-            float x_n = 0.f;
-            CUDA_CHECK(cudaMemcpy(&x_n, s->d_nrm, sizeof(float),
-                                  cudaMemcpyDeviceToHost));
+            float const x_n = hn[k + c];
             double const den = s->a_inf * static_cast<double>(x_n)
                              + static_cast<double>(b_norm[c]);
             double const rel = static_cast<double>(r_norm)
@@ -2342,7 +2493,8 @@ double solve(
 
                 is at the level this residual can resolve. It is formed in
                 DF32, so its own noise is a few u_ff (0.3 to 4 u_ff at the
-                floor on the cells traced); RESID_TOL = 8 u_ff. A column
+                floor on the cells traced at n <= 8192); RESID_TOL is
+                resid_tol, 8 u_ff up to n = 4096. A column
                 that stops above it is reported as not converged
                 (last_converged), whatever stopped it.
 
@@ -2352,7 +2504,7 @@ double solve(
                 steps (2e-8, 8e-8, 6e-8, 7e-8, then a clean 0.3x a step),
                 the correction ratio did not improve over those steps, and
                 the stall rule ended the solve at step 4. */
-            double const RESID_TOL = 8. * 0x1p-49;
+            double const RESID_TOL = resid_tol;
             /*  A residual of exactly zero after the first step, or a
                 non-finite norm, is an overflowed iterate, not a solution:
                 the max-norm kernels drop NaNs. The entries themselves are
@@ -2373,6 +2525,7 @@ double solve(
             if (!sane && it > 3 && !trace) {
                 /*  nothing can come back from an overflowed iterate */
                 done[c] = 2; certified[c] = 0; diverged[c] = 1;
+                report(it, c, r_norm, x_n, rel, drel, resid_ok, stop_test::nonfinite);
                 continue;
             }
 
@@ -2389,6 +2542,7 @@ double solve(
                 && rho_est[c] / (1. - rho_est[c]) * drel <= 4. * 0x1p-49 && !trace) {
                 done[c] = 1;
                 certified[c] = 1;
+                report(it, c, r_norm, x_n, rel, drel, resid_ok, stop_test::contraction_bound);
                 continue;
             }
             if (it > 1 && small[c] >= 1 && (warm_ok || small[c] >= 2)) {
@@ -2398,6 +2552,7 @@ double solve(
                         so, stagnated above tolerance otherwise. */
                     done[c] = resid_ok? 1 : 2;
                     certified[c] = resid_ok? 1 : 0;
+                    report(it, c, r_norm, x_n, rel, drel, resid_ok, stop_test::small_correction);
                     continue;
                 }
             }
@@ -2425,9 +2580,11 @@ double solve(
                         on to the cap and is reported from there. */
                     done[c] = 2;
                     certified[c] = 1;
+                    report(it, c, r_norm, x_n, rel, drel, resid_ok, stop_test::stall);
                     continue;
                 }
             }
+            report(it, c, r_norm, x_n, rel, drel, resid_ok, stop_test::none);
             ++n_active;
         }
         s->mark(0);
@@ -2476,12 +2633,28 @@ double solve(
                                           n * sizeof(float)));
                 }
             s->mark(1);
+            if (gmres_dnorm) {
+                CUDA_CHECK(cudaMemcpyAsync(s->d_zh, s->d_xh, nk * sizeof(float), cudaMemcpyDeviceToDevice, 0));
+                CUDA_CHECK(cudaMemcpyAsync(s->d_zl, s->d_xl, nk * sizeof(float), cudaMemcpyDeviceToDevice, 0));
+            }
+            g_trace_it = it;
             gmres_inner(s, n, static_cast<int>(k), static_cast<int>(ld),
                         inner_j_cur, s->d_rh, s->d_rl, s->d_xh, s->d_xl);
             s->mark(2);
-            for (std::size_t c = 0; c != k; ++c)
-                if (!done[c])
-                    ++it_col[c];
+            for (std::size_t c = 0; c != k; ++c) {
+                if (done[c])
+                    continue;
+                ++it_col[c];
+                if (!gmres_dnorm)
+                    continue;
+                LAUNCH((difference_kernel<<<g, T>>>(
+                    n, s->d_xh + c * ld, s->d_xl + c * ld,
+                    s->d_zh + c * ld, s->d_zl + c * ld, s->d_yh + c * ld)));
+                CUDA_CHECK(cudaMemsetAsync(d_dn + c, 0, sizeof(float), 0));
+                LAUNCH((max_abs_kernel<<<g, T>>>(n, s->d_yh + c * ld, d_dn + c)));
+                pending[c] = 1;
+                pending_it[c] = it;
+            }
             s->mark(3);
             continue;
         }
@@ -2530,45 +2703,28 @@ double solve(
             if (done[c])
                 continue;
 
-            /*  rho estimate from the correction, BEFORE applying it. */
-            CUDA_CHECK(cudaMemset(s->d_nrm, 0, sizeof(float)));
-            LAUNCH((max_abs_kernel<<<g, T>>>(n, s->d_yh + c * ld,
-                                             s->d_nrm)));
-            float dn = 0.f;
-            CUDA_CHECK(cudaMemcpy(&dn, s->d_nrm, sizeof(float),
-                                  cudaMemcpyDeviceToHost));
-            double const dcur = static_cast<double>(dn);
-            if (d_prev[c] > 0. && dcur > 0.) {
-                double const ratio = dcur / d_prev[c];
-                rho_est[c] = ratio;
-                /*  A margin and a minimum iteration count, for the
-                    same reason the stall rule carries `it > 3`: the
-                    first few corrections are not monotone, the residual
-                    that produced them has its own noise, and a bare
-                    "ratio > 1 twice" cut healthy solves off at step 2 --
-                    clustered k=3 kappa=1e8 went from converging in 6 to
-                    stopping at 3. The margin is 5 percent, which is
-                    well inside the 1.10 the diverging cell shows. */
-                /*  RECORD, do not stop.
+            /*  rho estimate from the correction, BEFORE applying it; read
+                with the next iteration's norms (take_correction_norm).
 
-                    Stopping on "two consecutive growing corrections"
-                    was tried and costs accuracy: correction norms are
-                    not monotone in the first few steps, and the rule
-                    cut clustered k=3 kappa=1e8 from reaching 4.7e-18 in
-                    6 iterations to stopping at 7.8e-15 in 3. The harm
-                    from the old behaviour was never the wasted
-                    iterations -- it was the FALSE VERDICT, and that is
-                    fixed where verdicts are decided rather than by
-                    truncating the solve. The margin is 5 percent, well
-                    inside the 1.10 the diverging cell shows. */
-                if (ratio > 1.05) {
-                    if (++growing[c] >= 2 && it > 3)
-                        diverged[c] = 1;
-                } else {
-                    growing[c] = 0;
-                }
-            }
-            d_prev[c] = dcur;
+                RECORD, do not stop.
+
+                Stopping on "two consecutive growing corrections"
+                was tried and costs accuracy: correction norms are
+                not monotone in the first few steps, and the rule
+                cut clustered k=3 kappa=1e8 from reaching 4.7e-18 in
+                6 iterations to stopping at 7.8e-15 in 3. The harm
+                from the old behaviour was never the wasted
+                iterations -- it was the FALSE VERDICT, and that is
+                fixed where verdicts are decided rather than by
+                truncating the solve. A margin and a minimum iteration
+                count, for the same reason the stall rule carries
+                `it > 3`: a bare "ratio > 1 twice" cut healthy solves
+                off at step 2 -- clustered k=3 kappa=1e8 went from
+                converging in 6 to stopping at 3. */
+            CUDA_CHECK(cudaMemsetAsync(d_dn + c, 0, sizeof(float), 0));
+            LAUNCH((max_abs_kernel<<<g, T>>>(n, s->d_yh + c * ld, d_dn + c)));
+            pending[c] = 1;
+            pending_it[c] = it;
 
             LAUNCH((add_correction_kernel<<<g, T>>>(
                 n, s->d_yh + c * ld, s->d_yl + c * ld,
@@ -2576,6 +2732,15 @@ double solve(
             ++it_col[c];
         }
         s->mark(3);
+    }
+
+    /*  corrections applied on the last pass, read for the state they leave */
+    if (std::find(pending.begin(), pending.end(), 1) != pending.end()) {
+        CUDA_CHECK(cudaMemcpy(hn.data() + 2 * k, d_dn, k * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+        for (std::size_t c = 0; c != k; ++c)
+            if (pending[c])
+                take_correction_norm(c, hn[2 * k + c]);
     }
 
     for (std::size_t c = 0; c != k; ++c) {
@@ -2612,7 +2777,7 @@ double solve(
             through an exit: it is judged on the last residual it formed,
             which is one correction behind. */
         bool const ok = done[c]? (certified[c] != 0)
-                               : (rel_last[c] <= 8. * 0x1p-49);
+                               : (rel_last[c] <= resid_tol);
         if (!ok)
             s->last_converged = 0;
         s->last_rel = std::max(s->last_rel, rel_last[c]);
@@ -2800,6 +2965,12 @@ void set_forced_pivots(state *s, int const *host_piv) {
 void set_step_hook(step_hook_fn fn, void *ctx) {
     g_step_hook = fn;
     g_step_hook_ctx = ctx;
+}
+
+void set_trace_sink(trace_outer_fn outer, trace_inner_fn inner, void *ctx) {
+    g_trace_outer = outer;
+    g_trace_inner = inner;
+    g_trace_ctx = ctx;
 }
 
 bool last_converged(state const *s) {
