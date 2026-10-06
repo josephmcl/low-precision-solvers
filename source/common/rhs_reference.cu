@@ -268,6 +268,9 @@ conditioning measure_conditioning(problem &prob, double const *d_x) {
     k_abs_matvec<<<blocks(n), 256>>>(n, inv, w, v); KERNEL_CHECK();            /* |A^-1| |A| |x| */
     double const xn = inf_norm(n, d_x);
     out.cond_ax = (xn > 0.) ? inf_norm(n, v) / xn : 0.;
+    k_abs_rowsum<<<blocks(n), 256>>>(n, prob.d_a, w); KERNEL_CHECK();          /* |A| 1 */
+    k_abs_matvec<<<blocks(n), 256>>>(n, inv, w, v); KERNEL_CHECK();            /* |A^-1| |A| 1 */
+    out.cond_skeel = inf_norm(n, v);
     CUDA_CHECK(cudaDeviceSynchronize());
     cudaFree(inv); cudaFree(v); cudaFree(w);
     return out;

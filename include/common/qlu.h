@@ -207,6 +207,13 @@ void apply_inverse(state *s, double *d_out, double const *d_in);
     prepared from. Needs the factor only: it sizes the solve workspace itself. */
 double skeel_estimate(state *s, double const *d_a, int const itmax = 5);
 
+/*  Hager estimate of || |A^-1| |A| |x| ||_inf through the factor, and in
+    d_rhs the right-hand side D_v sign, v = |A| |x|, whose solution's
+    infinity norm is a lower bound on the same quantity. Solving for it with
+    solve() gives the bound to the accuracy of the refinement; divided by
+    ||x||_inf it estimates cond(A, x) without forming A^-1. */
+double cond_ax_rhs(state *s, double const *d_a, double const *d_x, double *d_rhs, int const itmax = 5);
+
 /*  Diagnostics from the last solve.
 
     `rho` is the worst column's ||d_{k+1}||/||d_k||, which in exact

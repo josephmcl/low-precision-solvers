@@ -1,4 +1,5 @@
 #include "common/problem.h"
+#include <cstdlib>
 
 namespace harness {
 
@@ -282,11 +283,32 @@ static void _spectral(std::vector<double> &a, std::size_t const n,
         double nrm = 0.;
         for (std::size_t i = 0; i != n; ++i) nrm += w[i] * w[i];
         double const beta = 2. / nrm;
-        for (std::size_t i = 0; i != n; ++i) {
-            double dot = 0.;
-            for (std::size_t j = 0; j != n; ++j) dot += m[i + j * n] * w[j];
-            dot *= beta;
-            for (std::size_t j = 0; j != n; ++j) m[i + j * n] -= dot * w[j];
+        if (std::getenv("LPS_SPECTRAL_ROWWISE") != nullptr) {
+            /*  the original form: one row at a time, stride n */
+            for (std::size_t i = 0; i != n; ++i) {
+                double dot = 0.;
+                for (std::size_t j = 0; j != n; ++j) dot += m[i + j * n] * w[j];
+                dot *= beta;
+                for (std::size_t j = 0; j != n; ++j) m[i + j * n] -= dot * w[j];
+            }
+            return;
+        }
+        /*  Row i's dot product and update, with the loops interchanged so
+            that the array is walked down its columns. Each row's sum is
+            still accumulated in increasing j, so every entry is the same
+            double as with the row loop outside; at n = 32768 the strided
+            form took ten minutes on a slow host. */
+        std::vector<double> dot(n, 0.);
+        for (std::size_t j = 0; j != n; ++j) {
+            double const wj = w[j];
+            double const *col = m.data() + j * n;
+            for (std::size_t i = 0; i != n; ++i) dot[i] += col[i] * wj;
+        }
+        for (std::size_t i = 0; i != n; ++i) dot[i] *= beta;
+        for (std::size_t j = 0; j != n; ++j) {
+            double const wj = w[j];
+            double *col = m.data() + j * n;
+            for (std::size_t i = 0; i != n; ++i) col[i] -= dot[i] * wj;
         }
     };
 
@@ -467,6 +489,36 @@ void warm_libraries(problem &prob) {
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+namespace {
+
+__global__ void k_fingerprint(std::size_t const m, double const *a, unsigned long long *acc) {
+    unsigned long long x = 0ull, s = 0ull;
+    for (std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; i < m;
+         i += static_cast<std::size_t>(blockDim.x) * gridDim.x) {
+        unsigned long long h = static_cast<unsigned long long>(__double_as_longlong(a[i])) + i * 0x9E3779B97F4A7C15ull;
+        h ^= h >> 30; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 27; h *= 0x94D049BB133111EBull; h ^= h >> 31;
+        x ^= h; s += h;
+    }
+    atomicXor(acc, x);
+    atomicAdd(acc + 1, s);
+}
+
+} /* namespace */
+
+/*  A fingerprint of the matrix bytes: every entry's bit pattern hashed with
+    its index, reduced by xor and by sum (both independent of the order the
+    threads finish in). Two runs print the same pair exactly when they were
+    given the same n x n doubles. */
+void matrix_fingerprint(problem const &prob, unsigned long long out[2]) {
+    unsigned long long *d = nullptr;
+    CUDA_CHECK(cudaMalloc(&d, 2 * sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMemset(d, 0, 2 * sizeof(unsigned long long)));
+    k_fingerprint<<<4096, 256>>>(prob.n * prob.n, prob.d_a, d);
+    KERNEL_CHECK();
+    CUDA_CHECK(cudaMemcpy(out, d, 2 * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    cudaFree(d);
 }
 
 } /* namespace harness */

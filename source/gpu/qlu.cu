@@ -337,6 +337,11 @@ state *create(
             char const *e = std::getenv("LPS_SR");
             if (e != nullptr && e[0] == '1')
                 set_rounding(rounding::stochastic);
+            /*  LPS_SR_STREAM=<integer> moves the dither stream: an
+                independent draw over the same positions. */
+            char const *st = std::getenv("LPS_SR_STREAM");
+            if (st != nullptr && *st != '\0')
+                set_sr_stream(std::strtoull(st, nullptr, 10));
         }
     }
 
@@ -2935,6 +2940,17 @@ __global__ void abs_row_sum_kernel(int const n, double const *a, double *v) {
     v[i] = acc;
 }
 
+/*  v = |A| |x| */
+__global__ void abs_row_weighted_kernel(int const n, double const *a, double const *x, double *v) {
+    int const i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n)
+        return;
+    double acc = 0.;
+    for (int j = 0; j != n; ++j)
+        acc += fabs(a[static_cast<std::size_t>(j) * n + i]) * fabs(x[j]);
+    v[i] = acc;
+}
+
 __global__ void scatter_f32_kernel(int const n, int const *perm, float const *z, float *x) {
     int const i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n)
@@ -2972,11 +2988,14 @@ void apply_inverse_transpose_f32(state *s, float *d_w, float *d_tmp) {
     CUDA_CHECK(cudaMemcpy(d_w, d_tmp, n * sizeof(float), cudaMemcpyDeviceToDevice));
 }
 
-/*  cond_Skeel(A, 1) = || D_v A^-T ||_1, v = |A| 1, by Hager's algorithm
-    through the factor on the device: the product with A^-1 is
-    apply_inverse, the one with A^-T the blocked substitution above. The
-    iteration and its vectors of length n stay on the host. */
-double skeel_estimate(state *s, double const *d_a, int const itmax) {
+/*  || D_v A^-T ||_1 by Hager's algorithm through the factor on the device:
+    the product with A^-1 is apply_inverse, the one with A^-T the blocked
+    substitution above. The iteration and its vectors of length n stay on the
+    host. v = |A| 1 gives cond_Skeel(A, 1); v = |A| |x| (d_x given) gives
+    || |A^-1| |A| |x| ||_inf. With d_rhs, D_v sign(y) of the best iterate is
+    left there: || A^-1 (D_v sign) ||_inf is a lower bound on the same norm
+    that the caller can evaluate with a refined solve. */
+static double hager_weighted(state *s, double const *d_a, double const *d_x, double *d_rhs, int const itmax) {
     if (s == nullptr || !ensure_rhs(s, 1))
         return -1.;
     std::size_t const n = s->n;
@@ -2988,8 +3007,11 @@ double skeel_estimate(state *s, double const *d_a, int const itmax) {
     CUDA_CHECK(cudaMalloc(&d_out, n * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_w, n * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_t, n * sizeof(float)));
-    LAUNCH((abs_row_sum_kernel<<<(ni + 255) / 256, 256>>>(ni, d_a, d_v)));
-    std::vector<double> v(n), x(n, 1. / static_cast<double>(n)), y(n), z(n), t(n);
+    if (d_x == nullptr)
+        LAUNCH((abs_row_sum_kernel<<<(ni + 255) / 256, 256>>>(ni, d_a, d_v)));
+    else
+        LAUNCH((abs_row_weighted_kernel<<<(ni + 255) / 256, 256>>>(ni, d_a, d_x, d_v)));
+    std::vector<double> v(n), x(n, 1. / static_cast<double>(n)), y(n), z(n), t(n), best;
     std::vector<float> f(n);
     CUDA_CHECK(cudaMemcpy(v.data(), d_v, n * sizeof(double), cudaMemcpyDeviceToHost));
     auto matvec = [&](std::vector<double> const &in, std::vector<double> &out) {          /* D_v A^-T in */
@@ -3014,6 +3036,7 @@ double skeel_estimate(state *s, double const *d_a, int const itmax) {
         est = e;
         std::vector<double> sg(n);
         for (std::size_t i = 0; i != n; ++i) sg[i] = (y[i] >= 0.)? 1. : -1.;
+        if (d_rhs != nullptr) best = sg;
         rmatvec(sg, z);
         std::size_t jm = 0;
         for (std::size_t i = 1; i != n; ++i) if (std::fabs(z[i]) > std::fabs(z[jm])) jm = i;
@@ -3029,8 +3052,20 @@ double skeel_estimate(state *s, double const *d_a, int const itmax) {
     double alt = 0.;
     for (double q : y) alt += std::fabs(q);
     alt = 2. * alt / (3. * static_cast<double>(n));
+    if (d_rhs != nullptr) {
+        for (std::size_t i = 0; i != n; ++i) t[i] = v[i] * best[i];
+        CUDA_CHECK(cudaMemcpy(d_rhs, t.data(), n * sizeof(double), cudaMemcpyHostToDevice));
+    }
     cudaFree(d_v); cudaFree(d_in); cudaFree(d_out); cudaFree(d_w); cudaFree(d_t);
     return std::max(est, alt);
+}
+
+double skeel_estimate(state *s, double const *d_a, int const itmax) {
+    return hager_weighted(s, d_a, nullptr, nullptr, itmax);
+}
+
+double cond_ax_rhs(state *s, double const *d_a, double const *d_x, double *d_rhs, int const itmax) {
+    return hager_weighted(s, d_a, d_x, d_rhs, itmax);
 }
 
 void set_force_iters(int const n) { g_force_iters = n; }

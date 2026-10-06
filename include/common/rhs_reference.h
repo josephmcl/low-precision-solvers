@@ -36,6 +36,7 @@ reference_info reference_solution(problem &prob, double const *d_xtrue, double *
 struct conditioning {
     double sigma_max = 0., sigma_min = 0., kappa_2 = 0.;   /* power / inverse iteration */
     double kappa_inf = 0., cond_ax = 0.;                   /* explicit FP64 inverse     */
+    double cond_skeel = 0.;                                /* || |A^-1| |A| ||_inf, same inverse */
     int    iterations = 0;
 };
 

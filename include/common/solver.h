@@ -84,6 +84,17 @@ struct state {
     int         status         = 0;
     int         raw_iterations = 0;
 
+    /*  Vendor IRS only: the refinement solver it was run with (0 classical,
+        1 GMRES, 2 classical with inner GMRES), its iteration caps as set,
+        and the two counts cuSOLVER reports afterwards. */
+    int         irs_refine      = 0;
+    int         irs_max_iters   = 0;
+    int         irs_max_inner   = 0;
+    int         irs_niters      = 0;
+    int         irs_outer_niters = 0;
+    double      irs_tol         = 0.;     /* cusolverDnIRSParamsSetTol value; 0 = not set (cuSOLVER's default) */
+    int         irs_fallback_on = 1;      /* 0: cusolverDnIRSParamsDisableFallback was called */
+
     /*  True when the method reported a factor/solve breakdown. The reporter
         prints "--" in those columns otherwise rather than a zero that would
         read as "free". */

@@ -161,4 +161,8 @@ private:
     exposed so a driver adding new vendor calls can warm those too. */
 void warm_libraries(problem &prob);
 
+/*  xor and sum reductions of a per-entry hash of the matrix (bits and index):
+    equal pairs mean equal matrix bytes. */
+void matrix_fingerprint(problem const &prob, unsigned long long out[2]);
+
 } /* namespace harness */
