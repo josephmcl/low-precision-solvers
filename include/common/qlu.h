@@ -201,6 +201,12 @@ enum class rounding { nearest, stochastic };
     access to M at large n. */
 void apply_inverse(state *s, double *d_out, double const *d_in);
 
+/*  cond_Skeel(A, 1) = || diag(|A| 1) A^-T ||_1, estimated by Hager's
+    algorithm through the factor on the device (about five products with
+    A^-1 and with A^-T). d_a is the column-major FP64 matrix the factor was
+    prepared from. Call after a solve or a probe, as apply_inverse. */
+double skeel_estimate(state *s, double const *d_a, int const itmax = 5);
+
 /*  Diagnostics from the last solve.
 
     `rho` is the worst column's ||d_{k+1}||/||d_k||, which in exact

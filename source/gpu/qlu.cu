@@ -2019,6 +2019,22 @@ void select_panel_variant() {
         setenv("PANEL1B", "1", 1);
 }
 
+/*  The slice products with the slices as FP16 operands and an FP32
+    accumulator: the same integers as the INT8 kernel, bit for bit, for
+    b <= 1040. Taken where the INT8 tensor instructions are slow, which is
+    compute capability 10.3 (151 TOPS against 1010 for FP16, register only).
+    LPS_PRODUCTS=int8 or fp16 overrides. */
+bool fp16_products() {
+    char const *e = std::getenv("LPS_PRODUCTS");
+    if (e != nullptr)
+        return std::string(e) == "fp16";
+    int dev = 0, major = 0, minor = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+    cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+    return major == 10 && minor == 3;
+}
+
 void select_fused_update(std::size_t const n, int const b) {
     static bool captured = false;
     static std::string caller_set;
@@ -2045,6 +2061,8 @@ void select_fused_update(std::size_t const n, int const b) {
             setenv("FUSE", "5", 1);
         else if (int8lu_has_tcgen05())
             setenv("FUSE", "6", 1);
+        else if (fp16_products())
+            setenv("FUSE", "7", 1);
         else
             setenv("FUSE", "4", 1);
     } else if (b == 512 && n % 512 == 0 && int8lu_has_tcgen05() && INT8LU_TC5_KCHUNKS) {
@@ -2903,6 +2921,117 @@ void apply_inverse(state *s, double *d_out, double const *d_in) {
     }
     LAUNCH((combine_kernel<<<g, T>>>(n, s->d_yh, s->d_yl, d_out)));
     CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+/*  v = |A| 1 for a column-major A: one thread a row, so a warp reads 32
+    neighbouring rows of the same column. */
+__global__ void abs_row_sum_kernel(int const n, double const *a, double *v) {
+    int const i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n)
+        return;
+    double acc = 0.;
+    for (int j = 0; j != n; ++j)
+        acc += fabs(a[static_cast<std::size_t>(j) * n + i]);
+    v[i] = acc;
+}
+
+__global__ void scatter_f32_kernel(int const n, int const *perm, float const *z, float *x) {
+    int const i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
+        x[perm[i]] = z[i];
+}
+
+/*  w <- A^-T w through the stored factor, single precision on the high word.
+    The carrier is row major, so as a column-major array it is the transpose
+    of the packed factor: its lower triangle is U^T and its strictly upper
+    triangle is L^T (unit diagonal). Blocked substitution, a trsv and a gemv a
+    block. Only the estimate below uses it; the high word is enough there,
+    since the factor itself carries a few bits. */
+void apply_inverse_transpose_f32(state *s, float *d_w, float *d_tmp) {
+    int const n = static_cast<int>(s->n);
+    int const nb = 256;
+    float const minus = -1.f, one = 1.f;
+    float const *c = s->d_hi;
+    for (int j0 = 0; j0 < n; j0 += nb) {                   /* U^T w = y */
+        int const w = std::min(nb, n - j0), j1 = j0 + w;
+        CUBLAS_CHECK(cublasStrsv(s->blas, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT, w,
+                                 c + j0 + static_cast<std::size_t>(j0) * n, n, d_w + j0, 1));
+        if (j1 < n)
+            CUBLAS_CHECK(cublasSgemv(s->blas, CUBLAS_OP_N, n - j1, w, &minus, c + j1 + static_cast<std::size_t>(j0) * n, n,
+                                     d_w + j0, 1, &one, d_w + j1, 1));
+    }
+    for (int j1 = n; j1 > 0; j1 -= nb) {                   /* L^T x = w */
+        int const j0 = std::max(j1 - nb, 0), w = j1 - j0;
+        CUBLAS_CHECK(cublasStrsv(s->blas, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N, CUBLAS_DIAG_UNIT, w,
+                                 c + j0 + static_cast<std::size_t>(j0) * n, n, d_w + j0, 1));
+        if (j0 > 0)
+            CUBLAS_CHECK(cublasSgemv(s->blas, CUBLAS_OP_N, j0, w, &minus, c + static_cast<std::size_t>(j0) * n, n,
+                                     d_w + j0, 1, &one, d_w, 1));
+    }
+    LAUNCH((scatter_f32_kernel<<<(n + 255) / 256, 256>>>(n, s->d_perm, d_w, d_tmp)));
+    CUDA_CHECK(cudaMemcpy(d_w, d_tmp, n * sizeof(float), cudaMemcpyDeviceToDevice));
+}
+
+/*  cond_Skeel(A, 1) = || D_v A^-T ||_1, v = |A| 1, by Hager's algorithm
+    through the factor on the device: the product with A^-1 is
+    apply_inverse, the one with A^-T the blocked substitution above. The
+    iteration and its vectors of length n stay on the host. Call after a
+    solve or a probe, as apply_inverse. */
+double skeel_estimate(state *s, double const *d_a, int const itmax) {
+    if (s == nullptr)
+        return -1.;
+    std::size_t const n = s->n;
+    int const ni = static_cast<int>(n);
+    double *d_v = nullptr, *d_in = nullptr, *d_out = nullptr;
+    float *d_w = nullptr, *d_t = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_v, n * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_in, n * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_out, n * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_w, n * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_t, n * sizeof(float)));
+    LAUNCH((abs_row_sum_kernel<<<(ni + 255) / 256, 256>>>(ni, d_a, d_v)));
+    std::vector<double> v(n), x(n, 1. / static_cast<double>(n)), y(n), z(n), t(n);
+    std::vector<float> f(n);
+    CUDA_CHECK(cudaMemcpy(v.data(), d_v, n * sizeof(double), cudaMemcpyDeviceToHost));
+    auto matvec = [&](std::vector<double> const &in, std::vector<double> &out) {          /* D_v A^-T in */
+        for (std::size_t i = 0; i != n; ++i) f[i] = static_cast<float>(in[i]);
+        CUDA_CHECK(cudaMemcpy(d_w, f.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+        apply_inverse_transpose_f32(s, d_w, d_t);
+        CUDA_CHECK(cudaMemcpy(f.data(), d_w, n * sizeof(float), cudaMemcpyDeviceToHost));
+        for (std::size_t i = 0; i != n; ++i) out[i] = v[i] * static_cast<double>(f[i]);
+    };
+    auto rmatvec = [&](std::vector<double> const &in, std::vector<double> &out) {         /* A^-1 D_v in */
+        for (std::size_t i = 0; i != n; ++i) t[i] = v[i] * in[i];
+        CUDA_CHECK(cudaMemcpy(d_in, t.data(), n * sizeof(double), cudaMemcpyHostToDevice));
+        apply_inverse(s, d_out, d_in);
+        CUDA_CHECK(cudaMemcpy(out.data(), d_out, n * sizeof(double), cudaMemcpyDeviceToHost));
+    };
+    double est = 0.;
+    for (int it = 0; it != itmax; ++it) {
+        matvec(x, y);
+        double e = 0.;
+        for (double q : y) e += std::fabs(q);
+        if (it > 0 && e <= est) break;
+        est = e;
+        std::vector<double> sg(n);
+        for (std::size_t i = 0; i != n; ++i) sg[i] = (y[i] >= 0.)? 1. : -1.;
+        rmatvec(sg, z);
+        std::size_t jm = 0;
+        for (std::size_t i = 1; i != n; ++i) if (std::fabs(z[i]) > std::fabs(z[jm])) jm = i;
+        double zx = 0.;
+        for (std::size_t i = 0; i != n; ++i) zx += z[i] * x[i];
+        if (it > 0 && std::fabs(z[jm]) <= zx) break;
+        x.assign(n, 0.); x[jm] = 1.;
+    }
+    std::vector<double> x2(n);
+    for (std::size_t i = 0; i != n; ++i)
+        x2[i] = ((i % 2)? -1. : 1.) * (1. + static_cast<double>(i) / static_cast<double>(std::max<std::size_t>(n - 1, 1)));
+    matvec(x2, y);
+    double alt = 0.;
+    for (double q : y) alt += std::fabs(q);
+    alt = 2. * alt / (3. * static_cast<double>(n));
+    cudaFree(d_v); cudaFree(d_in); cudaFree(d_out); cudaFree(d_w); cudaFree(d_t);
+    return std::max(est, alt);
 }
 
 void set_force_iters(int const n) { g_force_iters = n; }
