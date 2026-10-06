@@ -2975,10 +2975,9 @@ void apply_inverse_transpose_f32(state *s, float *d_w, float *d_tmp) {
 /*  cond_Skeel(A, 1) = || D_v A^-T ||_1, v = |A| 1, by Hager's algorithm
     through the factor on the device: the product with A^-1 is
     apply_inverse, the one with A^-T the blocked substitution above. The
-    iteration and its vectors of length n stay on the host. Call after a
-    solve or a probe, as apply_inverse. */
+    iteration and its vectors of length n stay on the host. */
 double skeel_estimate(state *s, double const *d_a, int const itmax) {
-    if (s == nullptr)
+    if (s == nullptr || !ensure_rhs(s, 1))
         return -1.;
     std::size_t const n = s->n;
     int const ni = static_cast<int>(n);

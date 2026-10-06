@@ -146,6 +146,7 @@ void solve_split_mpir(
     double previous = 0., first = 0.;
     std::size_t used = 0;
 
+
     /*  A cap, not a schedule: the loop stops on its own test below and reports
         the count it used. */
     /*  Exposed for the same reason R-IR's is: so the stopping rule can be
@@ -211,6 +212,22 @@ void solve_split_mpir(
 
     st.solve_ms     = watch.stop();
     st.n_iterations = used;
+
+    /*  The loop leaves on a stalled correction whether or not it got
+        anywhere, so the status comes from one more residual, of the iterate
+        returned, formed outside the stopwatch: converged if it is within
+        2^-40 of ||b||, stopped without converging otherwise. */
+    double b_norm = 0., r_norm = 0.;
+    CUDA_CHECK(cudaMemcpy(
+        d_acc, d_b, nk * sizeof(double), cudaMemcpyDeviceToDevice));
+    ozaki::column_max(ws.d_nu, d_x, n, k, prob);
+    ozaki::accumulate_product(
+        d_acc, st.d_a_hi, d_x, n, k, ozaki::shape::full, ws, prob);
+    ozaki::accumulate_product(
+        d_acc, st.d_a_lo, d_x, n, k, ozaki::shape::full, ws, prob);
+    CUBLAS_CHECK(cublasDnrm2(prob.blas, static_cast<int>(nk), d_b, 1, &b_norm));
+    CUBLAS_CHECK(cublasDnrm2(prob.blas, static_cast<int>(nk), d_acc, 1, &r_norm));
+    st.status = (r_norm <= 0x1p-40 * b_norm)? 1 : 2;
 }
 
 } /* namespace solver */
